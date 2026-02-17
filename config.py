@@ -34,4 +34,4 @@ REGIONS: dict[str, str] = {
     "val": "C. Valenciana",
 }
 
-RSS_URL_TEMPLATE = "https://www.aemet.es/es/rss_info/avisos/{code}"
+RSS_INDEX_URL_TEMPLATE = "https://www.aemet.es/es/rss_info/avisos/{code}"

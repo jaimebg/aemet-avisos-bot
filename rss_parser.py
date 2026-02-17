@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
+from urllib.request import urlopen
 
 import feedparser
 
-from config import REGIONS, RSS_URL_TEMPLATE
+from config import REGIONS, RSS_INDEX_URL_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +16,12 @@ LEVEL_EMOJI = {
     "naranja": "🟠",
     "rojo": "🔴",
 }
+
+_RSS_LINK_RE = re.compile(
+    r'href="(/documentos_d/eltiempo/prediccion/avisos/rss/[^"]*_RSS\.xml)"'
+)
+
+BASE_URL = "https://www.aemet.es"
 
 
 @dataclass
@@ -52,22 +60,46 @@ def _parse_level(title: str) -> str | None:
     return None
 
 
-def fetch_alerts(region_code: str) -> list[Alert]:
-    url = RSS_URL_TEMPLATE.format(code=region_code)
+def _discover_feed_urls(region_code: str) -> list[str]:
+    """Scrape the AEMET index page for a region to find per-zone RSS XML links."""
+    index_url = RSS_INDEX_URL_TEMPLATE.format(code=region_code)
+    try:
+        with urlopen(index_url, timeout=30) as resp:
+            html = resp.read().decode("iso-8859-15", errors="replace")
+    except Exception:
+        logger.exception("Error fetching RSS index for %s", region_code)
+        return []
+
+    paths = _RSS_LINK_RE.findall(html)
+    # Deduplicate while preserving order
+    seen = set()
+    urls = []
+    for path in paths:
+        if path not in seen:
+            seen.add(path)
+            urls.append(BASE_URL + path)
+    return urls
+
+
+def _parse_feed(url: str) -> list[Alert]:
+    """Parse a single RSS feed URL and return alerts (skipping summary items)."""
     try:
         feed = feedparser.parse(url)
     except Exception:
-        logger.exception("Error fetching RSS for %s", region_code)
+        logger.exception("Error parsing feed %s", url)
         return []
 
     if feed.bozo and not feed.entries:
-        logger.warning("Feed error for %s: %s", region_code, feed.bozo_exception)
+        logger.warning("Feed error for %s: %s", url, feed.bozo_exception)
         return []
 
     alerts: list[Alert] = []
     for entry in feed.entries:
-        guid = entry.get("id") or entry.get("link", "")
         title = entry.get("title", "")
+        # Skip "Estado completo de avisos" summary items
+        if title.startswith("Estado completo"):
+            continue
+        guid = entry.get("id") or entry.get("link", "")
         alerts.append(
             Alert(
                 title=title,
@@ -79,3 +111,20 @@ def fetch_alerts(region_code: str) -> list[Alert]:
             )
         )
     return alerts
+
+
+def fetch_alerts(region_code: str) -> list[Alert]:
+    """Fetch all alerts for a region by discovering and parsing its RSS feeds."""
+    feed_urls = _discover_feed_urls(region_code)
+    if not feed_urls:
+        logger.info("No RSS feeds found for region %s", region_code)
+        return []
+
+    all_alerts: list[Alert] = []
+    seen_guids: set[str] = set()
+    for url in feed_urls:
+        for alert in _parse_feed(url):
+            if alert.guid not in seen_guids:
+                seen_guids.add(alert.guid)
+                all_alerts.append(alert)
+    return all_alerts
