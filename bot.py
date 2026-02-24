@@ -36,7 +36,7 @@ async def poll_alerts(context) -> None:
 
     for region_code in regions:
         alerts = fetch_alerts(region_code)
-        new_alerts = [a for a in alerts if not is_alert_seen(a.guid)]
+        new_alerts = [a for a in alerts if not is_alert_seen(a.canonical_id)]
         if not new_alerts:
             continue
 
@@ -52,7 +52,7 @@ async def poll_alerts(context) -> None:
                     logger.exception(
                         "Failed to send alert to user %d", user_id
                     )
-            mark_alert_seen(alert.guid)
+            mark_alert_seen(alert.canonical_id)
 
     # Cleanup old seen alerts once per cycle
     cleanup_old_alerts(days=7)

@@ -17,6 +17,10 @@ LEVEL_EMOJI = {
     "rojo": "🔴",
 }
 
+# AEMET GUIDs look like Z_CAP_C_LEMM_20260224101529_AFAZ711501COCO2521.xml
+# The timestamp (14 digits) changes on every republication; the suffix is stable.
+_GUID_TIMESTAMP_RE = re.compile(r"Z_CAP_C_LEMM_\d{14}_(.+)")
+
 _RSS_LINK_RE = re.compile(
     r'href="(/documentos_d/eltiempo/prediccion/avisos/rss/[^"]*_RSS\.xml)"'
 )
@@ -32,6 +36,12 @@ class Alert:
     guid: str
     pub_date: str
     level: str | None  # amarillo / naranja / rojo
+
+    @property
+    def canonical_id(self) -> str:
+        """Stable identifier that doesn't change when AEMET republishes the same alert."""
+        m = _GUID_TIMESTAMP_RE.match(self.guid)
+        return m.group(1) if m else self.guid
 
     @property
     def emoji(self) -> str:
@@ -121,10 +131,10 @@ def fetch_alerts(region_code: str) -> list[Alert]:
         return []
 
     all_alerts: list[Alert] = []
-    seen_guids: set[str] = set()
+    seen_ids: set[str] = set()
     for url in feed_urls:
         for alert in _parse_feed(url):
-            if alert.guid not in seen_guids:
-                seen_guids.add(alert.guid)
+            if alert.canonical_id not in seen_ids:
+                seen_ids.add(alert.canonical_id)
                 all_alerts.append(alert)
     return all_alerts
