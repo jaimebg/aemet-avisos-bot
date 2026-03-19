@@ -39,8 +39,15 @@ class Alert:
 
     @property
     def canonical_id(self) -> str:
-        """Stable identifier that doesn't change when AEMET republishes the same alert."""
-        m = _GUID_TIMESTAMP_RE.match(self.guid)
+        """Stable identifier that doesn't change when AEMET republishes the same alert.
+
+        GUIDs may be full URLs like:
+          https://www.aemet.es/.../Z_CAP_C_LEMM_20260319104642_AFAZ659201VIRM2121.xml
+        or bare filenames like:
+          Z_CAP_C_LEMM_20260319104642_AFAZ659201VIRM2121.xml
+        We use search() (not match()) so the pattern works regardless of prefix.
+        """
+        m = _GUID_TIMESTAMP_RE.search(self.guid)
         return m.group(1) if m else self.guid
 
     @property
