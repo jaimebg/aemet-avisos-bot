@@ -8,7 +8,7 @@
     <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
     <a href="https://www.python.org/downloads/"><img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-blue.svg"></a>
     <a href="https://t.me/BotFather"><img alt="Built for Telegram" src="https://img.shields.io/badge/Platform-Telegram-26A5E4.svg"></a>
-    <img alt="Zero dependencies, pure stdlib extras" src="https://img.shields.io/badge/dependencies-3-brightgreen.svg">
+    <img alt="3 lightweight dependencies" src="https://img.shields.io/badge/dependencies-3-brightgreen.svg">
   </p>
 </p>
 
