@@ -156,16 +156,6 @@ def get_user_subscriptions(user_id: int) -> list[str]:
     return [r[0] for r in rows]
 
 
-def get_subscribers_for_region(region_code: str) -> list[int]:
-    """Get user IDs subscribed to a region."""
-    conn = _connect()
-    rows = conn.execute(
-        "SELECT user_id FROM subscriptions WHERE region_code = ?",
-        (region_code,),
-    ).fetchall()
-    return [r[0] for r in rows]
-
-
 def get_subscribed_regions() -> list[str]:
     """Get region codes that have at least one subscriber."""
     conn = _connect()

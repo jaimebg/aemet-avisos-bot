@@ -42,17 +42,6 @@ def test_remove_all_subscriptions_returns_count_and_empties_list(temp_db):
     assert database.get_user_subscriptions(2) == ["cat"]
 
 
-def test_get_subscribers_for_region_excludes_other_regions(temp_db):
-    database.add_subscription(1, "mad")
-    database.add_subscription(2, "mad")
-    database.add_subscription(3, "and")
-
-    subscribers = database.get_subscribers_for_region("mad")
-
-    assert sorted(subscribers) == [1, 2]
-    assert 3 not in subscribers
-
-
 def test_get_subscribed_regions_returns_distinct_codes_with_a_subscriber(temp_db):
     database.add_subscription(1, "mad")
     database.add_subscription(2, "mad")

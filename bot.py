@@ -35,7 +35,9 @@ from database import (
 )
 from handlers import (
     callback_handler,
+    current_alerts_command,
     help_command,
+    level_command,
     my_subscriptions_command,
     start_command,
     subscribe_command,
@@ -198,6 +200,8 @@ async def post_init(app: Application) -> None:
             BotCommand("suscribir", "Suscribirse a una comunidad"),
             BotCommand("desuscribir", "Eliminar una suscripción"),
             BotCommand("mis_avisos", "Ver tus suscripciones"),
+            BotCommand("avisos", "Ver avisos activos ahora"),
+            BotCommand("nivel", "Elegir nivel mínimo de aviso"),
             BotCommand("ayuda", "Ayuda"),
         ]
     )
@@ -235,6 +239,8 @@ def main() -> None:
     app.add_handler(CommandHandler("suscribir", subscribe_command))
     app.add_handler(CommandHandler("desuscribir", unsubscribe_command))
     app.add_handler(CommandHandler("mis_avisos", my_subscriptions_command))
+    app.add_handler(CommandHandler("avisos", current_alerts_command))
+    app.add_handler(CommandHandler("nivel", level_command))
 
     # Inline button callbacks
     app.add_handler(CallbackQueryHandler(callback_handler))
