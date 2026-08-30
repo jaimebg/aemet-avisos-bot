@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from urllib.request import urlopen
 
 import feedparser
+import httpx
 
 from config import (
     AEMET_BASE_URL,
+    HTTP_MAX_CONCURRENCY,
+    HTTP_MAX_RETRIES,
+    HTTP_TIMEOUT_SECONDS,
+    HTTP_USER_AGENT,
     LEVEL_RANK,
     REGIONS,
     RSS_INDEX_URL_TEMPLATE,
@@ -170,20 +176,72 @@ def _parse_validity(description: str) -> tuple[datetime | None, datetime | None]
     return starts_at, ends_at
 
 
-def _discover_feed_urls(region_code: str) -> list[str]:
+def build_client() -> httpx.AsyncClient:
+    """Build the shared HTTP client used to talk to AEMET.
+
+    Callers own the client's lifecycle (use it as an `async with` context).
+    """
+    return httpx.AsyncClient(
+        timeout=HTTP_TIMEOUT_SECONDS,
+        headers={"User-Agent": HTTP_USER_AGENT},
+        follow_redirects=True,
+    )
+
+
+async def _get(
+    client: httpx.AsyncClient, url: str, semaphore: asyncio.Semaphore
+) -> bytes | None:
+    """Fetch a URL's body, retrying on network errors and 5xx responses.
+
+    Never raises: a 4xx response is logged and returns None immediately
+    (not retried); a network error or 5xx response is retried up to
+    HTTP_MAX_RETRIES times with exponential backoff, then logged and
+    returns None. The semaphore bounds how many requests are in flight at
+    once and is only held for the duration of the actual request.
+    """
+    last_error: Exception | None = None
+    for attempt in range(HTTP_MAX_RETRIES + 1):
+        try:
+            async with semaphore:
+                response = await client.get(url)
+            response.raise_for_status()
+            return response.content
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code < 500:
+                logger.warning(
+                    "HTTP %s fetching %s: %s", exc.response.status_code, url, exc
+                )
+                return None
+            last_error = exc
+        except httpx.HTTPError as exc:
+            last_error = exc
+
+        if attempt < HTTP_MAX_RETRIES:
+            await asyncio.sleep(0.5 * 2**attempt)
+
+    logger.warning(
+        "Giving up on %s after %d attempt(s): %s",
+        url,
+        HTTP_MAX_RETRIES + 1,
+        last_error,
+    )
+    return None
+
+
+async def _discover_feed_urls(
+    region_code: str, client: httpx.AsyncClient, semaphore: asyncio.Semaphore
+) -> list[str]:
     """Scrape the AEMET index page for a region to find per-zone RSS XML links."""
     index_url = RSS_INDEX_URL_TEMPLATE.format(code=region_code)
-    try:
-        with urlopen(index_url, timeout=30) as resp:
-            page_html = resp.read().decode("iso-8859-15", errors="replace")
-    except Exception:
-        logger.exception("Error fetching RSS index for %s", region_code)
+    data = await _get(client, index_url, semaphore)
+    if data is None:
         return []
 
+    page_html = data.decode("iso-8859-15", errors="replace")
     paths = _RSS_LINK_RE.findall(page_html)
     # Deduplicate while preserving order
-    seen = set()
-    urls = []
+    seen: set[str] = set()
+    urls: list[str] = []
     for path in paths:
         if path not in seen:
             seen.add(path)
@@ -191,16 +249,20 @@ def _discover_feed_urls(region_code: str) -> list[str]:
     return urls
 
 
-def _parse_feed(url: str) -> list[Alert]:
-    """Parse a single RSS feed URL and return alerts (skipping summary items)."""
+def _parse_feed_bytes(data: bytes, source_url: str) -> list[Alert]:
+    """Parse a single RSS feed body and return alerts (skipping summary items).
+
+    Pure and synchronous: no network access, so it stays testable offline.
+    Never raises: malformed feed data simply yields no alerts.
+    """
     try:
-        feed = feedparser.parse(url)
+        feed = feedparser.parse(data)
     except Exception:
-        logger.exception("Error parsing feed %s", url)
+        logger.exception("Error parsing feed %s", source_url)
         return []
 
     if feed.bozo and not feed.entries:
-        logger.warning("Feed error for %s: %s", url, feed.bozo_exception)
+        logger.warning("Feed error for %s: %s", source_url, feed.bozo_exception)
         return []
 
     alerts: list[Alert] = []
@@ -228,18 +290,60 @@ def _parse_feed(url: str) -> list[Alert]:
     return alerts
 
 
-def fetch_alerts(region_code: str) -> list[Alert]:
-    """Fetch all alerts for a region by discovering and parsing its RSS feeds."""
-    feed_urls = _discover_feed_urls(region_code)
+async def _fetch_region_alerts(
+    region_code: str, client: httpx.AsyncClient, semaphore: asyncio.Semaphore
+) -> list[Alert]:
+    """Discover, fetch and parse all feeds for one region, deduplicated."""
+    feed_urls = await _discover_feed_urls(region_code, client, semaphore)
     if not feed_urls:
         logger.info("No RSS feeds found for region %s", region_code)
         return []
 
+    bodies = await asyncio.gather(
+        *(_get(client, url, semaphore) for url in feed_urls),
+        return_exceptions=False,
+    )
+
     all_alerts: list[Alert] = []
     seen_ids: set[str] = set()
-    for url in feed_urls:
-        for alert in _parse_feed(url):
+    for url, body in zip(feed_urls, bodies, strict=True):
+        if body is None:
+            continue
+        for alert in _parse_feed_bytes(body, url):
             if alert.canonical_id not in seen_ids:
                 seen_ids.add(alert.canonical_id)
                 all_alerts.append(alert)
     return all_alerts
+
+
+async def fetch_alerts(region_code: str, client: httpx.AsyncClient) -> list[Alert]:
+    """Fetch all alerts for a single region by discovering and parsing its feeds.
+
+    Alerts are deduplicated across the region's own feeds by canonical_id.
+    Bounds its own HTTP concurrency with a fresh semaphore, so it is safe to
+    call directly (outside of fetch_alerts_for_regions).
+    """
+    semaphore = asyncio.Semaphore(HTTP_MAX_CONCURRENCY)
+    return await _fetch_region_alerts(region_code, client, semaphore)
+
+
+async def fetch_alerts_for_regions(
+    region_codes: Sequence[str], client: httpx.AsyncClient
+) -> dict[str, list[Alert]]:
+    """Fetch alerts for several regions concurrently.
+
+    A single semaphore bounds HTTP concurrency across every region so real
+    concurrency never exceeds HTTP_MAX_CONCURRENCY. A region whose fetch
+    fails maps to an empty list and is logged; it never aborts the others.
+    """
+    semaphore = asyncio.Semaphore(HTTP_MAX_CONCURRENCY)
+
+    async def _safe_fetch(region_code: str) -> list[Alert]:
+        try:
+            return await _fetch_region_alerts(region_code, client, semaphore)
+        except Exception:
+            logger.exception("Error fetching alerts for region %s", region_code)
+            return []
+
+    results = await asyncio.gather(*(_safe_fetch(code) for code in region_codes))
+    return dict(zip(region_codes, results, strict=True))

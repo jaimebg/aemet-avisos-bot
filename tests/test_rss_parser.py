@@ -7,9 +7,10 @@ fixes the underlying behaviour also updates the corresponding test.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
-import feedparser
+import httpx
 import pytest
 
 from config import AEMET_BASE_URL
@@ -17,40 +18,11 @@ from rss_parser import (
     _RSS_LINK_RE,
     Alert,
     _discover_feed_urls,
+    _parse_feed_bytes,
     _parse_level,
     _parse_validity,
     _parse_zone,
 )
-
-
-def _alerts_from_feed(feed) -> list[Alert]:
-    """Build Alerts from a parsed feed using the same field mapping as
-    rss_parser._parse_feed, without going through _parse_feed itself (which
-    takes a URL and would hit the network).
-    """
-    alerts = []
-    for entry in feed.entries:
-        title = entry.get("title", "")
-        if title.startswith("Estado completo"):
-            continue
-        guid = entry.get("id") or entry.get("link", "")
-        description = entry.get("summary", "")
-        starts_at, ends_at = _parse_validity(description)
-        alerts.append(
-            Alert(
-                title=title,
-                description=description,
-                link=entry.get("link", ""),
-                guid=guid,
-                pub_date=entry.get("published", ""),
-                level=_parse_level(title),
-                zone=_parse_zone(title),
-                starts_at=starts_at,
-                ends_at=ends_at,
-            )
-        )
-    return alerts
-
 
 # --- canonical_id -----------------------------------------------------
 
@@ -149,8 +121,7 @@ def test_parse_level_prefers_most_severe_word_when_title_has_several():
 
 
 def test_parsing_cordoba_amarillo_feed_yields_one_alert(read_fixture):
-    feed = feedparser.parse(read_fixture("feed_cordoba_amarillo.xml"))
-    alerts = _alerts_from_feed(feed)
+    alerts = _parse_feed_bytes(read_fixture("feed_cordoba_amarillo.xml"), "source")
 
     assert len(alerts) == 1
     alert = alerts[0]
@@ -162,8 +133,7 @@ def test_parsing_cordoba_amarillo_feed_yields_one_alert(read_fixture):
 
 
 def test_parsing_madrid_sin_avisos_feed_yields_no_alerts(read_fixture):
-    feed = feedparser.parse(read_fixture("feed_madrid_sin_avisos.xml"))
-    alerts = _alerts_from_feed(feed)
+    alerts = _parse_feed_bytes(read_fixture("feed_madrid_sin_avisos.xml"), "source")
 
     assert alerts == []
 
@@ -188,24 +158,14 @@ def test_rss_link_re_finds_raw_matches_including_duplicate_and_ignores_atom(
     )
 
 
-def test_discover_feed_urls_deduplicates_to_three_ordered_urls(
-    monkeypatch, read_fixture
-):
-    html = read_fixture("index_mad.html").decode("iso-8859-15")
+async def test_discover_feed_urls_deduplicates_to_three_ordered_urls(read_fixture):
+    index_html = read_fixture("index_mad.html")
 
-    class _FakeResponse:
-        def __enter__(self):
-            return self
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=index_html)
 
-        def __exit__(self, *exc_info):
-            return False
-
-        def read(self):
-            return html.encode("iso-8859-15")
-
-    monkeypatch.setattr("rss_parser.urlopen", lambda url, timeout=30: _FakeResponse())
-
-    urls = _discover_feed_urls("mad")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        urls = await _discover_feed_urls("mad", client, asyncio.Semaphore(8))
 
     assert urls == [
         AEMET_BASE_URL
@@ -337,8 +297,7 @@ def test_format_message_escapes_link_quotes_and_ampersand_in_href():
 
 
 def test_format_message_matches_exact_contract_for_cordoba_fixture(read_fixture):
-    feed = feedparser.parse(read_fixture("feed_cordoba_amarillo.xml"))
-    alert = _alerts_from_feed(feed)[0]
+    alert = _parse_feed_bytes(read_fixture("feed_cordoba_amarillo.xml"), "source")[0]
 
     message = alert.format_message("and")
 

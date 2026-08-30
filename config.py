@@ -14,6 +14,11 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", "subscriptions.db")
 
 AEMET_BASE_URL = "https://www.aemet.es"
 
+HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
+HTTP_MAX_CONCURRENCY = int(os.getenv("HTTP_MAX_CONCURRENCY", "8"))
+HTTP_MAX_RETRIES = int(os.getenv("HTTP_MAX_RETRIES", "2"))
+HTTP_USER_AGENT = "aemet-avisos-bot/0.2 (+https://github.com/jaimebg/aemet-avisos-bot)"
+
 LEVELS: tuple[str, ...] = ("amarillo", "naranja", "rojo")
 LEVEL_RANK: dict[str, int] = {"amarillo": 1, "naranja": 2, "rojo": 3}
 DEFAULT_MIN_LEVEL = "amarillo"
