@@ -6,11 +6,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "subscriptions.db")
+
+AEMET_BASE_URL = "https://www.aemet.es"
+
+LEVELS: tuple[str, ...] = ("amarillo", "naranja", "rojo")
+LEVEL_RANK: dict[str, int] = {"amarillo": 1, "naranja": 2, "rojo": 3}
+DEFAULT_MIN_LEVEL = "amarillo"
+UNKNOWN_LEVEL_RANK = 3
 
 REGIONS: dict[str, str] = {
     "and": "Andalucía",
@@ -35,3 +42,20 @@ REGIONS: dict[str, str] = {
 }
 
 RSS_INDEX_URL_TEMPLATE = "https://www.aemet.es/es/rss_info/avisos/{code}"
+
+
+class ConfigError(RuntimeError):
+    pass
+
+
+def validate() -> None:
+    """Validate required configuration. Called from bot.main() before startup."""
+    if not TELEGRAM_TOKEN:
+        raise ConfigError(
+            "TELEGRAM_TOKEN is not set. Copy .env.example to .env and add your "
+            "token from @BotFather."
+        )
+    if POLL_INTERVAL_SECONDS < 60:
+        raise ConfigError(
+            f"POLL_INTERVAL_SECONDS must be at least 60 (got {POLL_INTERVAL_SECONDS})."
+        )
