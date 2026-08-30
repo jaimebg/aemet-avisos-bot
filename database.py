@@ -67,9 +67,7 @@ def remove_all_subscriptions(user_id: int) -> int:
     """Remove all subscriptions for a user. Returns count removed."""
     conn = _connect()
     try:
-        cursor = conn.execute(
-            "DELETE FROM subscriptions WHERE user_id = ?", (user_id,)
-        )
+        cursor = conn.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
         conn.commit()
         return cursor.rowcount
     finally:
@@ -81,7 +79,8 @@ def get_user_subscriptions(user_id: int) -> list[str]:
     conn = _connect()
     try:
         rows = conn.execute(
-            "SELECT region_code FROM subscriptions WHERE user_id = ? ORDER BY region_code",
+            "SELECT region_code FROM subscriptions "
+            "WHERE user_id = ? ORDER BY region_code",
             (user_id,),
         ).fetchall()
         return [r[0] for r in rows]
@@ -106,9 +105,7 @@ def get_subscribed_regions() -> list[str]:
     """Get region codes that have at least one subscriber."""
     conn = _connect()
     try:
-        rows = conn.execute(
-            "SELECT DISTINCT region_code FROM subscriptions"
-        ).fetchall()
+        rows = conn.execute("SELECT DISTINCT region_code FROM subscriptions").fetchall()
         return [r[0] for r in rows]
     finally:
         conn.close()

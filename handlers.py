@@ -26,7 +26,7 @@ WELCOME_TEXT = (
 )
 
 HELP_TEXT = (
-    "ℹ️ <b>Ayuda</b>\n\n"
+    "ℹ️ <b>Ayuda</b>\n\n"  # noqa: RUF001 (user-facing Spanish text, not code)
     "Este bot consulta periódicamente los avisos meteorológicos de la AEMET "
     "y te notifica si hay alertas en las comunidades autónomas a las que "
     "estés suscrito.\n\n"
@@ -70,9 +70,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
 
 
-async def subscribe_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_subs = set(get_user_subscriptions(update.effective_user.id))
     keyboard = _build_region_keyboard(CB_SUBSCRIBE, exclude=user_subs)
     if not keyboard.inline_keyboard:
@@ -99,9 +97,7 @@ async def unsubscribe_command(
         for code in subs
     ]
     rows = [buttons[i : i + COLUMNS] for i in range(0, len(buttons), COLUMNS)]
-    rows.append(
-        [InlineKeyboardButton("❌ Eliminar todas", callback_data=CB_UNSUB_ALL)]
-    )
+    rows.append([InlineKeyboardButton("❌ Eliminar todas", callback_data=CB_UNSUB_ALL)])
     await update.message.reply_text(
         "Elige la suscripción a eliminar:",
         reply_markup=InlineKeyboardMarkup(rows),
@@ -123,9 +119,7 @@ async def my_subscriptions_command(
     )
 
 
-async def callback_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -153,6 +147,4 @@ async def callback_handler(
 
     elif data == CB_UNSUB_ALL:
         count = remove_all_subscriptions(user_id)
-        await query.edit_message_text(
-            f"🗑 Se han eliminado {count} suscripción(es)."
-        )
+        await query.edit_message_text(f"🗑 Se han eliminado {count} suscripción(es).")

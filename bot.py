@@ -5,8 +5,8 @@ from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandle
 from config import POLL_INTERVAL_SECONDS, TELEGRAM_TOKEN
 from database import (
     cleanup_old_alerts,
-    get_subscribers_for_region,
     get_subscribed_regions,
+    get_subscribers_for_region,
     init_db,
     is_alert_seen,
     mark_alert_seen,
@@ -49,9 +49,7 @@ async def poll_alerts(context) -> None:
                         chat_id=user_id, text=message, parse_mode="HTML"
                     )
                 except Exception:
-                    logger.exception(
-                        "Failed to send alert to user %d", user_id
-                    )
+                    logger.exception("Failed to send alert to user %d", user_id)
             mark_alert_seen(alert.canonical_id)
 
     # Cleanup old seen alerts once per cycle
@@ -74,13 +72,9 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     # Periodic RSS polling
-    app.job_queue.run_repeating(
-        poll_alerts, interval=POLL_INTERVAL_SECONDS, first=10
-    )
+    app.job_queue.run_repeating(poll_alerts, interval=POLL_INTERVAL_SECONDS, first=10)
 
-    logger.info(
-        "Bot started. Polling AEMET every %d seconds.", POLL_INTERVAL_SECONDS
-    )
+    logger.info("Bot started. Polling AEMET every %d seconds.", POLL_INTERVAL_SECONDS)
     app.run_polling()
 
 

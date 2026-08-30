@@ -65,7 +65,7 @@ class Alert:
         ]
         if self.description:
             lines.append(f"\n{self.description}")
-        lines.append(f"\n🔗 <a href=\"{self.link}\">Más información</a>")
+        lines.append(f'\n🔗 <a href="{self.link}">Más información</a>')
         return "\n".join(lines)
 
 

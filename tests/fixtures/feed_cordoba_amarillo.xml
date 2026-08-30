@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>AEMET - Avisos de fenómenos meteorológicos adversos - Córdoba</title>
+    <link>https://www.aemet.es/es/eltiempo/prediccion/avisos?p=6114</link>
+    <description>Avisos de fenómenos meteorológicos adversos según el Plan Meteoalerta de la Agencia Estatal de Meteorología (AEMET) para Córdoba.</description>
+    <language>es</language>
+    <copyright>https://www.aemet.es/es/nota_legal</copyright>
+    <pubDate>2026-08-30T09:02:12+00:00</pubDate>
+    <lastBuildDate>2026-08-30T09:02:12+00:00</lastBuildDate>
+    <image>
+      <url>https://www.aemet.es/imagenes/gif/logo_AEMET_web.gif</url>
+    </image>
+    <item>
+      <title>Estado completo de avisos para Córdoba</title>
+      <description>Fichero tar.gz que contiene todos los avisos para Córdoba de 11:02 30-08-2026 CEST (UTC+2) a 23:59 01-09-2026 CEST (UTC+2).</description>
+      <link>https://www.aemet.es/documentos_d/eltiempo/prediccion/avisos/cap/Z_CAP_C_LEMM_20260830090212_AFAP6114.tar.gz</link>
+      <guid>Z_CAP_C_LEMM_20260830090212_AFAP6114.tar.gz</guid>
+      <pubDate>2026-08-30T09:02:12+00:00</pubDate>
+    </item>
+    <item>
+      <title>Aviso. Nivel amarillo. Temperaturas máximas. Campiña cordobesa</title>
+      <description>Aviso de temperatura máxima de nivel amarillo de 13:00 31-08-2026 CEST (UTC+2) a 20:59 31-08-2026 CEST (UTC+2).</description>
+      <link>https://www.aemet.es/documentos_d/eltiempo/prediccion/avisos/cap/Z_CAP_C_LEMM_20260830090212_AFAZ611402ATTA3119.xml</link>
+      <guid>Z_CAP_C_LEMM_20260830090212_AFAZ611402ATTA3119.xml</guid>
+      <pubDate>2026-08-30T09:02:12+00:00</pubDate>
+    </item>
+  </channel>
+</rss>
