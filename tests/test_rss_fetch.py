@@ -115,6 +115,7 @@ async def test_fetch_alerts_returns_empty_list_when_index_page_404s():
 
 async def test_fetch_alerts_skips_a_feed_that_always_500s(monkeypatch):
     monkeypatch.setattr(rss_parser.asyncio, "sleep", _instant_sleep)
+    monkeypatch.setattr(rss_parser, "HTTP_MAX_RETRIES", 2)
 
     broken_path = "/documentos_d/eltiempo/prediccion/avisos/rss/FEED_BROKEN_RSS.xml"
     ok_path = "/documentos_d/eltiempo/prediccion/avisos/rss/FEED_OK_RSS.xml"
@@ -135,8 +136,8 @@ async def test_fetch_alerts_skips_a_feed_that_always_500s(monkeypatch):
         alerts = await fetch_alerts("xx", client)
 
     assert [a.canonical_id for a in alerts] == ["OKOK3333.xml"]
-    # HTTP_MAX_RETRIES (2, the config default) retries after the first
-    # attempt: 3 attempts total before _get gives up on the broken feed.
+    # HTTP_MAX_RETRIES is pinned to 2 above: 2 retries after the first
+    # attempt, 3 attempts total before _get gives up on the broken feed.
     assert broken_call_count == 3
 
 
@@ -145,6 +146,7 @@ async def test_fetch_alerts_skips_a_feed_that_always_500s(monkeypatch):
 
 async def test_get_retries_once_on_500_then_succeeds(monkeypatch):
     monkeypatch.setattr(rss_parser.asyncio, "sleep", _instant_sleep)
+    monkeypatch.setattr(rss_parser, "HTTP_MAX_RETRIES", 2)
     call_count = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -188,6 +190,7 @@ async def test_get_does_not_retry_a_404():
 
 async def test_fetch_alerts_for_regions_isolates_a_failing_region(monkeypatch):
     monkeypatch.setattr(rss_parser.asyncio, "sleep", _instant_sleep)
+    monkeypatch.setattr(rss_parser, "HTTP_MAX_RETRIES", 2)
 
     ok_feed_path = "/documentos_d/eltiempo/prediccion/avisos/rss/FEED_MAD_RSS.xml"
     mad_index = _index_html([ok_feed_path])
