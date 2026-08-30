@@ -108,7 +108,12 @@ async def _deliver_region_alerts(
             pending.append((alert, None, True))
             continue
         stored_level = seen[alert.canonical_id]
-        if alert.level_rank > _stored_rank(stored_level):
+        # An unparseable level ranks 3 so the severity filter never discards
+        # it, but that rank is a guess, not evidence of an escalation. Without
+        # the `is not None` guard such an alert would out-rank its own stored
+        # NULL row on every single cycle (and would downgrade a known stored
+        # level to NULL), re-notifying every subscriber until AEMET drops it.
+        if alert.level is not None and alert.level_rank > _stored_rank(stored_level):
             # AEMET republished the alert at a higher level: notify again.
             pending.append((alert, stored_level, False))
 
@@ -164,6 +169,10 @@ def _maybe_cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def poll_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Periodic job: fetch AEMET feeds and deliver new or escalated alerts."""
+    # Pruning runs on its own schedule and must keep running even after the
+    # last user unsubscribes, so it happens before the early return below.
+    _maybe_cleanup(context)
+
     regions = get_subscribed_regions()
     if not regions:
         return
@@ -179,8 +188,6 @@ async def poll_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             # One misbehaving region must never abort the whole cycle.
             logger.exception("Error processing alerts for region %s", region_code)
-
-    _maybe_cleanup(context)
 
 
 async def post_init(app: Application) -> None:

@@ -8,9 +8,11 @@ and G6 (prune seen alerts on an interval, not every cycle).
 from __future__ import annotations
 
 import time
+import warnings
 
 import pytest
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
+from telegram.warnings import PTBDeprecationWarning
 
 import bot
 import database
@@ -204,6 +206,25 @@ async def test_alert_republished_at_a_lower_level_is_not_sent_and_keeps_its_leve
     assert database.get_seen_levels([CANONICAL_ID]) == {CANONICAL_ID: "rojo"}
 
 
+async def test_alert_that_becomes_unparseable_does_not_re_notify_or_downgrade(
+    temp_db, fetcher, context, fake_bot
+):
+    """A title that stops parsing is not an upgrade from amarillo either."""
+    database.add_subscription(1, "and")
+    fetcher.alerts_by_region = {"and": [make_alert("amarillo")]}
+    await bot.poll_alerts(context)
+    fake_bot.sent.clear()
+
+    fetcher.alerts_by_region = {
+        "and": [make_alert(None, published_at="20260224180000")]
+    }
+    await bot.poll_alerts(context)
+    await bot.poll_alerts(context)
+
+    assert fake_bot.sent == []
+    assert database.get_seen_levels([CANONICAL_ID]) == {CANONICAL_ID: "amarillo"}
+
+
 async def test_alert_with_a_legacy_null_stored_level_is_sent_again(
     temp_db, fetcher, context, fake_bot
 ):
@@ -305,6 +326,14 @@ async def test_alert_with_an_unknown_level_reaches_even_a_rojo_subscriber(
     assert fake_bot.recipients() == [1]
     assert database.get_seen_levels([CANONICAL_ID]) == {CANONICAL_ID: None}
 
+    # ...but rank 3 is a guess, not an escalation: the alert must not
+    # out-rank its own stored NULL row on every following cycle.
+    await bot.poll_alerts(context)
+    await bot.poll_alerts(context)
+
+    assert fake_bot.recipients() == [1]
+    assert database.get_seen_levels([CANONICAL_ID]) == {CANONICAL_ID: None}
+
 
 async def test_alert_with_no_eligible_recipients_is_recorded_without_sending(
     temp_db, fetcher, context, fake_bot
@@ -353,6 +382,15 @@ async def test_cleanup_runs_at_most_once_per_interval(
 
     assert calls == [bot.SEEN_RETENTION_DAYS, bot.SEEN_RETENTION_DAYS]
 
+    # Pruning keeps its own schedule even after the last user unsubscribes.
+    database.remove_all_subscriptions(1)
+    context.bot_data["last_cleanup_ts"] = (
+        time.monotonic() - 10 * bot.CLEANUP_INTERVAL_SECONDS
+    )
+    await bot.poll_alerts(context)
+
+    assert len(calls) == 3
+
 
 async def test_region_without_alerts_is_skipped_without_querying_the_database(
     temp_db, fetcher, context, fake_bot, monkeypatch
@@ -384,11 +422,19 @@ async def test_send_alert_return_value_for_success_and_each_caught_error(
     assert await bot._send_alert(fake_bot, 1, "hola") is True
     assert fake_bot.sent == [(1, "hola")]
 
+    with warnings.catch_warnings():
+        # RetryAfter's own __init__ reads its deprecated `retry_after`
+        # property while building its message. There is nothing for us to
+        # fix, so keep the noise out of the suite's output -- scoped to this
+        # one construction so the warning class stays visible elsewhere.
+        warnings.simplefilter("ignore", PTBDeprecationWarning)
+        flood_control = RetryAfter(3)
+
     database.add_subscription(7, "and")
     fake_bot.errors = {
         7: Forbidden("Forbidden: bot was blocked by the user"),
         8: BadRequest("Can't parse entities"),
-        9: RetryAfter(3),
+        9: flood_control,
         10: TelegramError("connection reset"),
     }
 
