@@ -1,0 +1,9 @@
+.git
+.venv
+.superpowers
+tests
+*.db
+__pycache__
+.github
+.DS_Store
+.env
