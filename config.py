@@ -12,6 +12,11 @@ POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "subscriptions.db")
 
+# How long a delivered alert stays in seen_alerts before being pruned, and how
+# often that pruning runs (it is far cheaper than one sweep per poll cycle).
+SEEN_RETENTION_DAYS = int(os.getenv("SEEN_RETENTION_DAYS", "7"))
+CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "3600"))
+
 AEMET_BASE_URL = "https://www.aemet.es"
 
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))

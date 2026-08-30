@@ -173,12 +173,6 @@ def get_subscribed_regions() -> list[str]:
     return [r[0] for r in rows]
 
 
-def is_alert_seen(guid: str) -> bool:
-    conn = _connect()
-    row = conn.execute("SELECT 1 FROM seen_alerts WHERE guid = ?", (guid,)).fetchone()
-    return row is not None
-
-
 def mark_alert_seen(guid: str, level: str | None = None) -> None:
     """Record a guid as seen, storing its severity level.
 

@@ -61,16 +61,17 @@ def test_get_subscribed_regions_returns_distinct_codes_with_a_subscriber(temp_db
     assert sorted(database.get_subscribed_regions()) == ["and", "mad"]
 
 
-def test_mark_alert_seen_and_is_alert_seen_round_trip(temp_db):
+def test_mark_alert_seen_and_get_seen_levels_round_trip(temp_db):
     guid = "AFAZ611402ATTA3119.xml"
 
-    assert database.is_alert_seen(guid) is False
-    database.mark_alert_seen(guid)
-    assert database.is_alert_seen(guid) is True
+    assert database.get_seen_levels([guid]) == {}
+    database.mark_alert_seen(guid, "amarillo")
+    assert database.get_seen_levels([guid]) == {guid: "amarillo"}
 
-    # INSERT OR IGNORE: marking the same guid again must not raise.
-    database.mark_alert_seen(guid)
-    assert database.is_alert_seen(guid) is True
+    # INSERT OR IGNORE: marking the same guid again must not raise, and must
+    # not overwrite the level stored the first time.
+    database.mark_alert_seen(guid, "rojo")
+    assert database.get_seen_levels([guid]) == {guid: "amarillo"}
 
 
 def test_cleanup_old_alerts_deletes_old_row_and_keeps_recent_one(temp_db):
@@ -79,12 +80,8 @@ def test_cleanup_old_alerts_deletes_old_row_and_keeps_recent_one(temp_db):
 
     # Insert the old row with raw SQL, matching the space-separated format
     # SQLite's CURRENT_TIMESTAMP default (and cleanup_old_alerts's own
-    # datetime('now', ...) comparison) use. mark_alert_seen() itself writes
-    # first_seen as datetime.now(timezone.utc).isoformat() ("...T...+00:00"),
-    # a different format (this is bug D10). This test only passes today
-    # because the "recent" row's date component (today) is lexically greater
-    # than the cutoff regardless of separator; Task 4 unifies the format so
-    # both styles of comparison agree in every case, not just this one.
+    # datetime('now', ...) comparison) use, which is what mark_alert_seen()
+    # writes too since Task 4 unified the format (bug D10).
     conn = sqlite3.connect(temp_db)
     try:
         conn.execute(
@@ -101,8 +98,7 @@ def test_cleanup_old_alerts_deletes_old_row_and_keeps_recent_one(temp_db):
     removed = database.cleanup_old_alerts()
 
     assert removed == 1
-    assert database.is_alert_seen(old_guid) is False
-    assert database.is_alert_seen(recent_guid) is True
+    assert database.get_seen_levels([old_guid, recent_guid]) == {recent_guid: None}
 
 
 def test_init_db_is_idempotent(temp_db):
