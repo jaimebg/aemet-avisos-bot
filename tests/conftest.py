@@ -36,18 +36,10 @@ def read_fixture() -> Callable[[str], bytes]:
 def temp_db(monkeypatch, tmp_path):
     db_path = tmp_path / "test.db"
     monkeypatch.setattr(config, "DATABASE_PATH", str(db_path))
-    # database.py today does `from config import DATABASE_PATH`, a name
-    # binding taken at import time, so patching config.DATABASE_PATH alone
-    # does not change what database._connect() opens. Patch the database
-    # module's own copy too so tests are actually isolated against today's
-    # source. Task 4's reset_connections()/refactor is expected to make this
-    # redundant.
-    monkeypatch.setattr(database, "DATABASE_PATH", str(db_path))
-    # Task 4 adds reset_connections(); call it only if it already exists.
-    getattr(database, "reset_connections", lambda: None)()
+    database.reset_connections()
     database.init_db()
     yield db_path
-    getattr(database, "reset_connections", lambda: None)()
+    database.reset_connections()
 
 
 @pytest.fixture
