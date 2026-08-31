@@ -81,9 +81,12 @@ main() {
 
     as_service_account git fetch --quiet origin "$BRANCH"
 
+    # Every git call goes through the service account, including the read-only
+    # ones: git refuses to operate on a repository owned by another user
+    # ("dubious ownership"), and this script normally runs as root.
     local current target
-    current=$(git rev-parse HEAD)
-    target=$(git rev-parse "origin/${BRANCH}")
+    current=$(as_service_account git rev-parse HEAD)
+    target=$(as_service_account git rev-parse "origin/${BRANCH}")
 
     # Nothing new. Stay silent, or the journal fills with one entry per run.
     [ "$current" = "$target" ] && exit 0
