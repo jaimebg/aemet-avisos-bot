@@ -39,3 +39,28 @@ jobs:
 
       - name: Build the Docker image
         run: docker build -t aemet-avisos-bot .
+
+  deploy-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint the deploy script
+        run: shellcheck deploy/update.sh
+
+      # systemd-analyze rejects units whose User or ExecStart cannot be
+      # resolved, so stand up just enough of the target layout for the check to
+      # be about the units themselves.
+      - name: Stage the paths the units reference
+        run: |
+          sudo useradd --system --shell /usr/sbin/nologin aemetbot
+          sudo mkdir -p /opt/aemet-avisos-bot/deploy /opt/aemet-avisos-bot/.venv/bin
+          sudo cp deploy/update.sh /opt/aemet-avisos-bot/deploy/update.sh
+          sudo ln -s "$(command -v python3)" /opt/aemet-avisos-bot/.venv/bin/python
+
+      - name: Verify the systemd units
+        run: |
+          systemd-analyze verify \
+            deploy/aemet-avisos-bot.service \
+            deploy/aemet-avisos-bot-update.service \
+            deploy/aemet-avisos-bot-update.timer

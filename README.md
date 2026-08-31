@@ -147,6 +147,37 @@ sudo systemctl enable --now aemet-avisos-bot
 
 The unit runs as the unprivileged `aemetbot` user, restarts automatically on failure, and locks down the filesystem (`ProtectSystem=strict`) with a single writable exception for `/opt/aemet-avisos-bot` — where `subscriptions.db` (the default `DATABASE_PATH`, resolved relative to `WorkingDirectory`) lives.
 
+### Automatic updates (optional)
+
+`deploy/update.sh` plus a systemd timer keeps the server in step with the deployment branch, without the server ever accepting an inbound connection or GitHub holding a key to it. Every five minutes the timer fetches the branch; when it finds a new commit **whose CI has passed**, it fast-forwards, reinstalls dependencies and restarts the bot.
+
+```bash
+sudo cp deploy/aemet-avisos-bot-update.service /etc/systemd/system/
+sudo cp deploy/aemet-avisos-bot-update.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now aemet-avisos-bot-update.timer
+
+systemctl list-timers aemet-avisos-bot-update.timer   # when it next runs
+journalctl -u aemet-avisos-bot-update -f              # what it did
+```
+
+It is deliberately conservative and fails closed — an unreachable GitHub API, a commit with no CI results, a red build, or a locally diverged checkout all leave the running version alone. A run that finds nothing new prints nothing, so the journal only ever shows real events.
+
+Tune it with a drop-in (`sudo systemctl edit aemet-avisos-bot-update.service`):
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `REPO_DIR` | Checkout to update | `/opt/aemet-avisos-bot` |
+| `BRANCH` | Branch to deploy | `main` |
+| `SERVICE` | Unit to restart | `aemet-avisos-bot` |
+| `RUN_AS` | Account owning the checkout | `aemetbot` |
+| `API_REPO` | `owner/name` used for the CI lookup | `jaimebg/aemet-avisos-bot` |
+| `REQUIRE_GREEN_CI` | Set to `0` to deploy without consulting CI | `1` |
+
+Change the interval by editing `OnUnitActiveSec` in the timer, and run a deploy immediately with `sudo systemctl start aemet-avisos-bot-update.service`.
+
+> **The database is not backed up before an update.** The schema migration runs once and is idempotent afterwards, so the exposure is small, but `subscriptions.db` holds every user's subscriptions — copy it somewhere safe before a release you have doubts about.
+
 ## 🏗️ How it works
 
 ```

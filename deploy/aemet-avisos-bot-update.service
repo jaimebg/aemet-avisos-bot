@@ -1,0 +1,16 @@
+[Unit]
+Description=Update aemet-avisos-bot from its deployment branch
+Documentation=https://github.com/jaimebg/aemet-avisos-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as root: it needs to restart the bot unit, and drops to the service
+# account itself for every write to the repository (see update.sh).
+ExecStart=/opt/aemet-avisos-bot/deploy/update.sh
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/aemet-avisos-bot
