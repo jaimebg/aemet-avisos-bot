@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>AEMET - Avisos de fenómenos meteorológicos adversos - Madrid</title>
+    <link>https://www.aemet.es/es/eltiempo/prediccion/avisos?p=7228</link>
+    <description>Avisos de fenómenos meteorológicos adversos según el Plan Meteoalerta de la Agencia Estatal de Meteorología (AEMET) para Madrid.</description>
+    <language>es</language>
+    <copyright>https://www.aemet.es/es/nota_legal</copyright>
+    <pubDate>2026-08-29T21:50:01+00:00</pubDate>
+    <lastBuildDate>2026-08-29T21:50:01+00:00</lastBuildDate>
+    <image>
+      <url>https://www.aemet.es/imagenes/gif/logo_AEMET_web.gif</url>
+    </image>
+    <item>
+      <title>Estado completo de avisos para Madrid. No hay avisos para Madrid</title>
+      <description>Fichero tar.gz que contiene todos los avisos para Madrid de 23:50 29-08-2026 CEST (UTC+2) a 23:59 01-09-2026 CEST (UTC+2).</description>
+      <link>https://www.aemet.es/documentos_d/eltiempo/prediccion/avisos/cap/Z_CAP_C_LEMM_20260829215001_AFAP7228.tar.gz</link>
+      <guid>Z_CAP_C_LEMM_20260829215001_AFAP7228.tar.gz</guid>
+      <pubDate>2026-08-29T21:50:01+00:00</pubDate>
+    </item>
+  </channel>
+</rss>

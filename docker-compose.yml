@@ -1,0 +1,21 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    # Pinned so the volume below is always where the bot writes, even if
+    # .env (copied from .env.example, which defaults to a bare-metal path)
+    # also sets DATABASE_PATH — an explicit environment entry here wins over
+    # env_file.
+    environment:
+      DATABASE_PATH: /data/subscriptions.db
+    restart: unless-stopped
+    volumes:
+      - aemet-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  aemet-data:

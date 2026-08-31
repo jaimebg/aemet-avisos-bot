@@ -1,0 +1,21 @@
+[Unit]
+Description=AEMET Avisos Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aemetbot
+WorkingDirectory=/opt/aemet-avisos-bot
+EnvironmentFile=/opt/aemet-avisos-bot/.env
+ExecStart=/opt/aemet-avisos-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/aemet-avisos-bot
+
+[Install]
+WantedBy=multi-user.target
