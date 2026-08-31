@@ -125,31 +125,48 @@ async def _deliver_region_alerts(
     recipients = get_subscribers_with_min_rank(region_code)
 
     for alert, previous_level, is_new in pending:
-        eligible = [
-            user_id for user_id, min_rank in recipients if min_rank <= alert.level_rank
-        ]
+        # Scoped to one alert on purpose. A failure after a successful send
+        # (mark_alert_seen hitting a full disk or a lock that outlives
+        # busy_timeout, say) must cost exactly that alert: a guard around the
+        # whole loop would leave the region's remaining alerts neither sent
+        # nor recorded. poll_alerts keeps a region-level guard as well, so a
+        # failure in the per-region setup above still cannot abort the cycle.
+        try:
+            eligible = [
+                user_id
+                for user_id, min_rank in recipients
+                if min_rank <= alert.level_rank
+            ]
 
-        delivered = 0
-        if eligible:
-            message = alert.format_message(region_code, previous_level=previous_level)
-            for user_id in eligible:
-                if await _send_alert(bot, user_id, message):
-                    delivered += 1
-
-            if delivered == 0:
-                logger.warning(
-                    "Alert %s (%s) reached none of its %d recipient(s); "
-                    "not recording it so the next cycle retries",
-                    alert.canonical_id,
-                    region_code,
-                    len(eligible),
+            delivered = 0
+            if eligible:
+                message = alert.format_message(
+                    region_code, previous_level=previous_level
                 )
-                continue
+                for user_id in eligible:
+                    if await _send_alert(bot, user_id, message):
+                        delivered += 1
 
-        if is_new:
-            mark_alert_seen(alert.canonical_id, alert.level)
-        else:
-            update_alert_level(alert.canonical_id, alert.level)
+                if delivered == 0:
+                    logger.warning(
+                        "Alert %s (%s) reached none of its %d recipient(s); "
+                        "not recording it so the next cycle retries",
+                        alert.canonical_id,
+                        region_code,
+                        len(eligible),
+                    )
+                    continue
+
+            if is_new:
+                mark_alert_seen(alert.canonical_id, alert.level)
+            else:
+                update_alert_level(alert.canonical_id, alert.level)
+        except Exception:
+            logger.exception(
+                "Error delivering alert %s for region %s",
+                alert.canonical_id,
+                region_code,
+            )
 
 
 def _maybe_cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -170,7 +187,15 @@ def _maybe_cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def poll_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Periodic job: fetch AEMET feeds and deliver new or escalated alerts."""
+    """Periodic job: fetch AEMET feeds and deliver new or escalated alerts.
+
+    Two cycles never overlap: PTB's JobQueue runs on an APScheduler
+    AsyncIOScheduler and does not override APScheduler's default
+    max_instances=1, so a cycle that overruns POLL_INTERVAL_SECONDS is skipped
+    rather than started alongside the running one. That is what keeps the
+    read-then-write in _deliver_region_alerts (get_seen_levels ... await ...
+    mark_alert_seen) from ever classifying the same alert as new twice.
+    """
     # Pruning runs on its own schedule and must keep running even after the
     # last user unsubscribes, so it happens before the early return below.
     _maybe_cleanup(context)
@@ -188,7 +213,10 @@ async def poll_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await _deliver_region_alerts(context.bot, region_code, alerts)
         except Exception:
-            # One misbehaving region must never abort the whole cycle.
+            # Narrower failures are already handled per alert inside
+            # _deliver_region_alerts; this catches the per-region setup (the
+            # seen-levels and subscriber lookups) so one misbehaving region
+            # still cannot abort the whole cycle.
             logger.exception("Error processing alerts for region %s", region_code)
 
 

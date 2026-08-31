@@ -26,7 +26,7 @@ AEMET Avisos Bot polls the official [AEMET RSS feeds](https://www.aemet.es/es/rs
 - 🎚️ **Severity levels** — 🟡 yellow / 🟠 orange / 🔴 red with one-tap links to details
 - 🔕 **Per-user severity filtering** — set a minimum level with `/nivel` to stop yellow (or yellow+orange) warnings from reaching you
 - 🔺 **Escalation notifications** — if AEMET upgrades an alert you already received (e.g. yellow → red), you're notified again
-- 🕒 **Validity windows** — every alert message shows exactly when it starts and ends
+- 🕒 **Validity windows** — an alert message shows exactly when it starts and ends, when AEMET publishes one
 - 📢 **On-demand lookup** — `/avisos` shows what's active right now in your regions, without waiting for the next push
 - 👥 **Per-user subscriptions** — follow as many regions as you want
 - 🧠 **Smart deduplication** — stable alert IDs survive AEMET's GUID churn, so you never get duplicate notifications
@@ -76,7 +76,7 @@ All settings live in `.env`:
 | Variable | Description | Default |
 |---|---|---|
 | `TELEGRAM_TOKEN` | Your bot token from @BotFather | — (required) |
-| `POLL_INTERVAL_SECONDS` | How often the RSS feeds are polled | `300` |
+| `POLL_INTERVAL_SECONDS` | How often the RSS feeds are polled (must be at least `60`) | `300` |
 | `DATABASE_PATH` | Path to the SQLite database | `subscriptions.db` |
 | `SEEN_RETENTION_DAYS` | Days a delivered alert is remembered before it's pruned | `7` |
 | `CLEANUP_INTERVAL_SECONDS` | Minimum seconds between two prunings of old seen alerts | `3600` |
@@ -100,7 +100,7 @@ ruff check .
 ruff format --check .
 ```
 
-CI (`.github/workflows/ci.yml`) runs the same two checks on Python 3.10 through 3.13 on every push and pull request.
+CI (`.github/workflows/ci.yml`) runs the same two checks on Python 3.10 through 3.13 on every push and pull request, plus a `docker build` of the image.
 
 ## 📦 Deployment
 

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import html
 import logging
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import ContextTypes
 
-from config import LEVEL_RANK, LEVELS, REGIONS
+from config import LEVELS, REGIONS, rank_for
 from database import (
     add_subscription,
     get_min_level,
@@ -63,6 +64,10 @@ COLUMNS = 2
 MAX_AVISOS_ALERTS = 10
 AEMET_AVISOS_URL = "https://www.aemet.es/es/eltiempo/prediccion/avisos"
 
+# Key under which /avisos keeps the ids of the users whose lookup is running.
+AVISOS_IN_FLIGHT_KEY = "avisos_in_flight"
+AVISOS_BUSY_TEXT = "⏳ Ya estoy consultando tus avisos. Espera unos segundos."
+
 LEVEL_LABELS = {
     "amarillo": "🟡 Amarillo y superiores",
     "naranja": "🟠 Naranja y rojo",
@@ -72,6 +77,16 @@ LEVEL_LABELS = {
 
 def _message(update: Update) -> Message | None:
     return update.effective_message
+
+
+def _region_name(region_code: str) -> str:
+    """Display name for a region code, HTML-escaped for parse_mode="HTML".
+
+    No name in REGIONS contains a character that needs escaping today, and the
+    fallback code comes from callback data a client could forge. Escape it
+    rather than reason about it.
+    """
+    return html.escape(REGIONS.get(region_code, region_code), quote=True)
 
 
 def _build_region_keyboard(
@@ -172,7 +187,7 @@ async def my_subscriptions_command(
     if not subs:
         await msg.reply_text("No tienes suscripciones. Usa /suscribir para añadir.")
         return
-    names = [f"• {REGIONS.get(c, c)}" for c in subs]
+    names = [f"• {_region_name(c)}" for c in subs]
     await msg.reply_text(
         "📋 <b>Tus suscripciones:</b>\n" + "\n".join(names), parse_mode="HTML"
     )
@@ -209,50 +224,70 @@ async def current_alerts_command(
         await msg.reply_text("No tienes suscripciones. Usa /suscribir para añadir.")
         return
 
-    placeholder = await msg.reply_text("⏳ Consultando avisos activos…")
-
-    async with build_client() as client:
-        alerts_by_region = await fetch_alerts_for_regions(regions, client)
-
-    min_level = get_min_level(user_id)
-    min_rank = LEVEL_RANK[min_level]
-    matched: list[tuple[str, Alert]] = [
-        (region_code, alert)
-        for region_code, alerts in alerts_by_region.items()
-        for alert in alerts
-        if min_rank <= alert.level_rank
-    ]
-
-    name = min_level.capitalize()
-    if not matched:
-        text = (
-            f"✅ No hay avisos activos en tus comunidades "
-            f"(nivel mínimo: <b>{name}</b>)."
-        )
-        await placeholder.edit_text(text, parse_mode="HTML")
+    # One /avisos at a time per user. The HTTP semaphore is process-wide, so
+    # without this guard a single user tapping the command repeatedly could
+    # queue up unbounded fetches against AEMET and starve the polling job.
+    in_flight: set[int] = context.bot_data.setdefault(AVISOS_IN_FLIGHT_KEY, set())
+    if user_id in in_flight:
+        await msg.reply_text(AVISOS_BUSY_TEXT)
         return
 
-    total = len(matched)
-    await placeholder.edit_text(f"📢 {total} aviso(s) activo(s):")
+    in_flight.add(user_id)
+    try:
+        placeholder = await msg.reply_text("⏳ Consultando avisos activos…")
 
-    shown = matched[:MAX_AVISOS_ALERTS]
-    for region_code, alert in shown:
-        await msg.reply_text(alert.format_message(region_code), parse_mode="HTML")
+        async with build_client() as client:
+            alerts_by_region = await fetch_alerts_for_regions(regions, client)
 
-    remaining = total - len(shown)
-    if remaining > 0:
-        await msg.reply_text(f"… y {remaining} avisos más. Consulta {AEMET_AVISOS_URL}")
+        min_level = get_min_level(user_id)
+        min_rank = rank_for(min_level)
+        matched: list[tuple[str, Alert]] = [
+            (region_code, alert)
+            for region_code, alerts in alerts_by_region.items()
+            for alert in alerts
+            if min_rank <= alert.level_rank
+        ]
+
+        name = min_level.capitalize()
+        if not matched:
+            text = (
+                f"✅ No hay avisos activos en tus comunidades "
+                f"(nivel mínimo: <b>{name}</b>)."
+            )
+            await placeholder.edit_text(text, parse_mode="HTML")
+            return
+
+        total = len(matched)
+        await placeholder.edit_text(f"📢 {total} aviso(s) activo(s):")
+
+        shown = matched[:MAX_AVISOS_ALERTS]
+        for region_code, alert in shown:
+            await msg.reply_text(alert.format_message(region_code), parse_mode="HTML")
+
+        remaining = total - len(shown)
+        if remaining > 0:
+            await msg.reply_text(
+                f"… y {remaining} avisos más. Consulta {AEMET_AVISOS_URL}"
+            )
+    finally:
+        # Always release, including on an exception: a stranded id would lock
+        # the user out of /avisos for the lifetime of the process.
+        in_flight.discard(user_id)
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     data = query.data
+    if not data:
+        # CallbackQuery.data is optional and this handler has no pattern, so
+        # every callback query reaches it -- including ones carrying no data.
+        return
     user_id = query.from_user.id
 
     if data.startswith(CB_SUBSCRIBE):
         region_code = data[len(CB_SUBSCRIBE) :]
-        region_name = REGIONS.get(region_code, region_code)
+        region_name = _region_name(region_code)
         added = add_subscription(user_id, region_code)
         if added:
             text = f"✅ Suscrito a <b>{region_name}</b>."
@@ -262,7 +297,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     elif data.startswith(CB_UNSUBSCRIBE):
         region_code = data[len(CB_UNSUBSCRIBE) :]
-        region_name = REGIONS.get(region_code, region_code)
+        region_name = _region_name(region_code)
         removed = remove_subscription(user_id, region_code)
         if removed:
             text = f"🗑 Suscripción a <b>{region_name}</b> eliminada."

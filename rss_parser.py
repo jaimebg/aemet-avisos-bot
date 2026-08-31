@@ -25,6 +25,30 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
+# One semaphore for the whole process, not one per call. Both callers -- the
+# polling job and the per-user /avisos command -- share it, so N concurrent
+# /avisos invocations cannot multiply the request rate we present to AEMET and
+# get the source IP throttled (which would degrade the push deliveries too).
+#
+# It is built lazily on first use inside a running loop rather than at import
+# time: an asyncio.Semaphore created outside a loop binds to the wrong one. It
+# is also rebuilt whenever the running loop changes, so a semaphore bound to a
+# closed loop can never leak into the next one (pytest-asyncio gives every test
+# its own loop).
+_semaphore: asyncio.Semaphore | None = None
+_semaphore_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    """Return the semaphore bounding HTTP concurrency on the running loop."""
+    global _semaphore, _semaphore_loop
+    loop = asyncio.get_running_loop()
+    if _semaphore is None or _semaphore_loop is not loop:
+        _semaphore = asyncio.Semaphore(HTTP_MAX_CONCURRENCY)
+        _semaphore_loop = loop
+    return _semaphore
+
+
 LEVEL_EMOJI = {
     "amarillo": "🟡",
     "naranja": "🟠",
@@ -268,10 +292,24 @@ def _parse_feed_bytes(data: bytes, source_url: str) -> list[Alert]:
     alerts: list[Alert] = []
     for entry in feed.entries:
         title = entry.get("title", "")
-        # Skip "Estado completo de avisos" summary items
+        guid = entry.get("id") or entry.get("link", "")
+        # Skip "Estado completo de avisos" summary items.
         if title.startswith("Estado completo"):
             continue
-        guid = entry.get("id") or entry.get("link", "")
+        # Belt and braces on the same summary item, in case AEMET rewords that
+        # title: it carries no level word, so it would rank UNKNOWN_LEVEL_RANK
+        # and reach even min_level="rojo" subscribers. Real alerts are CAP
+        # .xml documents; the summary is a .tar.gz. This rule fails closed, so
+        # log what it drops -- if AEMET ever changes the guid shape, that log
+        # line is the only warning an operator gets.
+        if not guid.endswith(".xml"):
+            logger.warning(
+                "Skipping non-CAP entry in %s: guid %r, title %r",
+                source_url,
+                guid,
+                title,
+            )
+            continue
         description = entry.get("summary", "")
         starts_at, ends_at = _parse_validity(description)
         alerts.append(
@@ -320,11 +358,10 @@ async def fetch_alerts(region_code: str, client: httpx.AsyncClient) -> list[Aler
     """Fetch all alerts for a single region by discovering and parsing its feeds.
 
     Alerts are deduplicated across the region's own feeds by canonical_id.
-    Bounds its own HTTP concurrency with a fresh semaphore, so it is safe to
-    call directly (outside of fetch_alerts_for_regions).
+    Shares the process-wide HTTP semaphore with every other caller, so it is
+    safe to call directly (outside of fetch_alerts_for_regions).
     """
-    semaphore = asyncio.Semaphore(HTTP_MAX_CONCURRENCY)
-    return await _fetch_region_alerts(region_code, client, semaphore)
+    return await _fetch_region_alerts(region_code, client, _get_semaphore())
 
 
 async def fetch_alerts_for_regions(
@@ -332,11 +369,12 @@ async def fetch_alerts_for_regions(
 ) -> dict[str, list[Alert]]:
     """Fetch alerts for several regions concurrently.
 
-    A single semaphore bounds HTTP concurrency across every region so real
-    concurrency never exceeds HTTP_MAX_CONCURRENCY. A region whose fetch
-    fails maps to an empty list and is logged; it never aborts the others.
+    The process-wide semaphore bounds HTTP concurrency across every region --
+    and across concurrent calls to this function -- so real concurrency never
+    exceeds HTTP_MAX_CONCURRENCY. A region whose fetch fails maps to an empty
+    list and is logged; it never aborts the others.
     """
-    semaphore = asyncio.Semaphore(HTTP_MAX_CONCURRENCY)
+    semaphore = _get_semaphore()
 
     async def _safe_fetch(region_code: str) -> list[Alert]:
         try:

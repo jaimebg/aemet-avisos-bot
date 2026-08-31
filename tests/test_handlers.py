@@ -6,6 +6,7 @@ update.effective_message is None, e.g. for an edited message or channel post).
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 
 import pytest
@@ -98,6 +99,13 @@ class FakeUpdate:
         self.callback_query = callback_query
 
 
+class FakeContext:
+    """The slice of ContextTypes.DEFAULT_TYPE that the handlers actually use."""
+
+    def __init__(self) -> None:
+        self.bot_data: dict[str, object] = {}
+
+
 class FakeClient:
     """Async context manager standing in for the httpx client."""
 
@@ -122,6 +130,11 @@ class FakeFetcher:
         return {
             code: list(self.alerts_by_region.get(code, [])) for code in region_codes
         }
+
+
+@pytest.fixture
+def context() -> FakeContext:
+    return FakeContext()
 
 
 @pytest.fixture
@@ -168,10 +181,32 @@ async def test_start_and_help_mention_all_seven_commands(temp_db):
         assert f"/{name}" in help_text
 
 
+# The five handlers that read update.effective_user. start_command and
+# help_command do not, so they have no guard to test.
+USER_GUARDED_HANDLERS = [
+    handlers.subscribe_command,
+    handlers.unsubscribe_command,
+    handlers.my_subscriptions_command,
+    handlers.current_alerts_command,
+    handlers.level_command,
+]
+
+
 @pytest.mark.parametrize("handler", COMMAND_HANDLERS)
 async def test_handler_returns_silently_when_message_is_none(temp_db, handler):
     update = FakeUpdate(message=None, user=FakeUser(1))
     await handler(update, None)  # must not raise
+
+
+@pytest.mark.parametrize("handler", USER_GUARDED_HANDLERS)
+async def test_handler_returns_silently_when_user_is_none(temp_db, handler):
+    """A channel post carries an effective_message but no effective_user."""
+    msg = FakeMessage()
+    update = FakeUpdate(message=msg, user=None)
+
+    await handler(update, None)  # must not raise
+
+    assert msg.reply_texts == []
 
 
 async def test_subscribe_excludes_existing_regions_and_reports_when_all_subscribed(
@@ -299,9 +334,9 @@ async def test_unknown_callback_data_is_ignored_without_raising(temp_db):
     assert query_bad_level.edited_texts == []
 
 
-async def test_avisos_with_no_subscriptions_never_fetches(temp_db, fetcher):
+async def test_avisos_with_no_subscriptions_never_fetches(temp_db, fetcher, context):
     update = FakeUpdate(message=FakeMessage(), user=FakeUser(1))
-    await handlers.current_alerts_command(update, None)
+    await handlers.current_alerts_command(update, context)
 
     assert update.effective_message.reply_texts == [
         "No tienes suscripciones. Usa /suscribir para añadir."
@@ -310,7 +345,7 @@ async def test_avisos_with_no_subscriptions_never_fetches(temp_db, fetcher):
 
 
 async def test_avisos_sends_one_message_per_alert_and_does_not_touch_seen_alerts(
-    temp_db, fetcher
+    temp_db, fetcher, context
 ):
     database.add_subscription(1, "and")
     fetcher.alerts_by_region = {
@@ -321,7 +356,7 @@ async def test_avisos_sends_one_message_per_alert_and_does_not_touch_seen_alerts
     }
 
     update = FakeUpdate(message=FakeMessage(), user=FakeUser(1))
-    await handlers.current_alerts_command(update, None)
+    await handlers.current_alerts_command(update, context)
 
     msg = update.effective_message
     placeholder = msg.replies[0]
@@ -340,7 +375,7 @@ async def test_avisos_sends_one_message_per_alert_and_does_not_touch_seen_alerts
     assert count == 0
 
 
-async def test_avisos_filters_by_users_minimum_level(temp_db, fetcher):
+async def test_avisos_filters_by_users_minimum_level(temp_db, fetcher, context):
     database.add_subscription(1, "and")
     database.set_min_level(1, "rojo")
     fetcher.alerts_by_region = {
@@ -351,7 +386,7 @@ async def test_avisos_filters_by_users_minimum_level(temp_db, fetcher):
     }
 
     update = FakeUpdate(message=FakeMessage(), user=FakeUser(1))
-    await handlers.current_alerts_command(update, None)
+    await handlers.current_alerts_command(update, context)
 
     msg = update.effective_message
     placeholder = msg.replies[0]
@@ -360,13 +395,15 @@ async def test_avisos_filters_by_users_minimum_level(temp_db, fetcher):
     assert "ROJO" in msg.reply_texts[1]
 
 
-async def test_avisos_caps_at_ten_messages_with_a_tail_message(temp_db, fetcher):
+async def test_avisos_caps_at_ten_messages_with_a_tail_message(
+    temp_db, fetcher, context
+):
     database.add_subscription(1, "and")
     alerts = [make_alert("amarillo", canonical_id=f"A{i}") for i in range(12)]
     fetcher.alerts_by_region = {"and": alerts}
 
     update = FakeUpdate(message=FakeMessage(), user=FakeUser(1))
-    await handlers.current_alerts_command(update, None)
+    await handlers.current_alerts_command(update, context)
 
     msg = update.effective_message
     # placeholder + 10 alert messages + 1 tail message
@@ -377,17 +414,103 @@ async def test_avisos_caps_at_ten_messages_with_a_tail_message(temp_db, fetcher)
 
 
 async def test_avisos_with_no_active_alerts_reports_current_minimum_level(
-    temp_db, fetcher
+    temp_db, fetcher, context
 ):
     database.add_subscription(1, "and")
     database.set_min_level(1, "naranja")
     fetcher.alerts_by_region = {"and": []}
 
     update = FakeUpdate(message=FakeMessage(), user=FakeUser(1))
-    await handlers.current_alerts_command(update, None)
+    await handlers.current_alerts_command(update, context)
 
     msg = update.effective_message
     placeholder = msg.replies[0]
     assert placeholder.edited_texts[0] == (
         "✅ No hay avisos activos en tus comunidades (nivel mínimo: <b>Naranja</b>)."
     )
+
+
+# --- /avisos per-user in-flight guard ----------------------------------------
+
+
+async def test_avisos_is_refused_while_the_same_user_already_has_one_in_flight(
+    temp_db, context, monkeypatch
+):
+    """One user must not be able to queue up unbounded fetches against AEMET."""
+    database.add_subscription(1, "and")
+    database.add_subscription(2, "and")
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def slow_fetch(region_codes, client):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return {code: [] for code in region_codes}
+
+    monkeypatch.setattr(handlers, "build_client", FakeClient)
+    monkeypatch.setattr(handlers, "fetch_alerts_for_regions", slow_fetch)
+
+    first_msg = FakeMessage()
+    first = asyncio.create_task(
+        handlers.current_alerts_command(
+            FakeUpdate(message=first_msg, user=FakeUser(1)), context
+        )
+    )
+    await started.wait()
+
+    # Same user again while the first lookup is still running: refused, with a
+    # message rather than silence, and without a second fetch.
+    second_msg = FakeMessage()
+    await handlers.current_alerts_command(
+        FakeUpdate(message=second_msg, user=FakeUser(1)), context
+    )
+
+    assert second_msg.reply_texts == [handlers.AVISOS_BUSY_TEXT]
+    assert calls == 1
+
+    # A different user is not blocked by the first user's lookup.
+    other_msg = FakeMessage()
+    other = asyncio.create_task(
+        handlers.current_alerts_command(
+            FakeUpdate(message=other_msg, user=FakeUser(2)), context
+        )
+    )
+    release.set()
+    await first
+    await other
+
+    assert calls == 2
+    assert other_msg.reply_texts[0] == "⏳ Consultando avisos activos…"
+
+    # The id is released once the lookup finishes, so /avisos works again.
+    third_msg = FakeMessage()
+    await handlers.current_alerts_command(
+        FakeUpdate(message=third_msg, user=FakeUser(1)), context
+    )
+
+    assert third_msg.reply_texts[0] == "⏳ Consultando avisos activos…"
+    assert calls == 3
+
+
+async def test_avisos_releases_the_in_flight_guard_when_the_lookup_raises(
+    temp_db, context, monkeypatch
+):
+    """An exception must not lock the user out of /avisos for good."""
+    database.add_subscription(1, "and")
+
+    async def exploding_fetch(region_codes, client):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(handlers, "build_client", FakeClient)
+    monkeypatch.setattr(handlers, "fetch_alerts_for_regions", exploding_fetch)
+
+    with pytest.raises(RuntimeError):
+        await handlers.current_alerts_command(
+            FakeUpdate(message=FakeMessage(), user=FakeUser(1)), context
+        )
+
+    assert context.bot_data[handlers.AVISOS_IN_FLIGHT_KEY] == set()

@@ -265,6 +265,67 @@ async def test_http_concurrency_never_exceeds_configured_maximum(monkeypatch):
         await fetch_alerts_for_regions(["r1", "r2", "r3"], client)
 
     assert max_in_flight <= 2
+    # Pin the intent: the cap must bound concurrency, not collapse it to a
+    # serial fetch (which would also satisfy the <= assertion above).
+    assert max_in_flight == 2
+
+
+# --- test 9b: the semaphore is process-wide, not per call -------------------
+
+
+async def test_concurrent_fetch_calls_share_one_process_wide_semaphore(monkeypatch):
+    """A per-call semaphore would let N callers multiply the ceiling by N.
+
+    /avisos calls fetch_alerts_for_regions once per user command, so the cap
+    has to hold across simultaneous calls -- otherwise a user tapping the
+    command repeatedly can get the bot's IP throttled by AEMET and take the
+    polling job's fetches down with it.
+    """
+    monkeypatch.setattr(rss_parser, "HTTP_MAX_CONCURRENCY", 2)
+
+    in_flight = 0
+    max_in_flight = 0
+
+    feed_path = "/documentos_d/eltiempo/prediccion/avisos/rss/FEED_RSS.xml"
+    index_html = _index_html([feed_path])
+    feed_bytes = _feed_xml("NOOP0000.xml", "Aviso. Nivel amarillo. Viento. Zona")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, max_in_flight
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        await asyncio.sleep(0.02)
+        in_flight -= 1
+        if request.url.path == feed_path:
+            return httpx.Response(200, content=feed_bytes)
+        return httpx.Response(200, content=index_html)
+
+    async with _client(handler) as client:
+        # Two /avisos-shaped calls plus a single-region fetch, all at once:
+        # fetch_alerts must share the same semaphore as fetch_alerts_for_regions.
+        await asyncio.gather(
+            fetch_alerts_for_regions(["r1", "r2", "r3"], client),
+            fetch_alerts_for_regions(["r4", "r5", "r6"], client),
+            fetch_alerts("r7", client),
+        )
+
+    assert max_in_flight == 2
+
+
+async def test_both_entry_points_use_the_same_semaphore_object():
+    assert rss_parser._get_semaphore() is rss_parser._get_semaphore()
+
+
+def test_semaphore_is_rebuilt_when_the_event_loop_changes():
+    """A semaphore bound to a closed loop must never leak into the next one."""
+
+    async def capture() -> asyncio.Semaphore:
+        return rss_parser._get_semaphore()
+
+    first = asyncio.run(capture())
+    second = asyncio.run(capture())
+
+    assert first is not second
 
 
 # --- test 10: _parse_feed_bytes never raises --------------------------------

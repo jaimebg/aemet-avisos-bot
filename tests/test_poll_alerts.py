@@ -7,6 +7,7 @@ and G6 (prune seen alerts on an interval, not every cycle).
 
 from __future__ import annotations
 
+import sqlite3
 import time
 import warnings
 
@@ -258,6 +259,75 @@ async def test_alert_is_not_recorded_when_every_send_fails_and_is_retried(
 
     assert sorted(fake_bot.recipients()) == [1, 2]
     assert database.get_seen_levels([CANONICAL_ID]) == {CANONICAL_ID: "naranja"}
+
+
+async def test_escalation_that_reaches_nobody_keeps_its_stored_level_and_retries(
+    temp_db, fetcher, context, fake_bot
+):
+    """D6 x D3: a failed escalation must not consume the escalation.
+
+    The `continue` that skips recording an undelivered alert has to precede
+    update_alert_level. If the stored level were raised to the new one anyway,
+    the next cycle would see no escalation at all and the red alert would
+    vanish for good -- silently, and exactly in the yellow-to-red case that
+    matters most.
+    """
+    database.add_subscription(1, "and")
+    database.add_subscription(2, "and")
+    fetcher.alerts_by_region = {"and": [make_alert("amarillo")]}
+    await bot.poll_alerts(context)
+
+    assert sorted(fake_bot.recipients()) == [1, 2]
+    fake_bot.sent.clear()
+
+    # AEMET escalates to red, but every send fails.
+    fake_bot.errors = {1: TelegramError("timeout"), 2: TelegramError("timeout")}
+    fetcher.alerts_by_region = {
+        "and": [make_alert("rojo", published_at="20260224180000")]
+    }
+    await bot.poll_alerts(context)
+
+    assert fake_bot.sent == []
+    assert database.get_seen_levels([CANONICAL_ID]) == {CANONICAL_ID: "amarillo"}
+
+    # Third cycle: sends work again, so the escalation is finally delivered.
+    fake_bot.errors = {}
+    await bot.poll_alerts(context)
+
+    assert sorted(fake_bot.recipients()) == [1, 2]
+    assert "Aviso ACTUALIZADO: AMARILLO → ROJO" in fake_bot.sent[0][1]
+    assert database.get_seen_levels([CANONICAL_ID]) == {CANONICAL_ID: "rojo"}
+
+
+async def test_a_failing_database_write_costs_only_its_own_alert(
+    temp_db, fetcher, context, fake_bot, monkeypatch
+):
+    """The per-alert guard: one alert's failure must not abort the region."""
+    database.add_subscription(1, "and")
+    fetcher.alerts_by_region = {
+        "and": [
+            make_alert("amarillo"),
+            make_alert("rojo", canonical_id=OTHER_CANONICAL_ID),
+        ]
+    }
+
+    real_mark_alert_seen = bot.mark_alert_seen
+
+    def failing_mark_alert_seen(guid: str, level: str | None = None) -> None:
+        if guid == CANONICAL_ID:
+            raise sqlite3.OperationalError("database is locked")
+        real_mark_alert_seen(guid, level)
+
+    monkeypatch.setattr(bot, "mark_alert_seen", failing_mark_alert_seen)
+
+    await bot.poll_alerts(context)
+
+    # Both alerts were sent; the second one was still recorded despite the
+    # first one's write blowing up.
+    assert len(fake_bot.messages_for(1)) == 2
+    assert database.get_seen_levels([CANONICAL_ID, OTHER_CANONICAL_ID]) == {
+        OTHER_CANONICAL_ID: "rojo"
+    }
 
 
 async def test_alert_is_recorded_when_at_least_one_send_succeeds(

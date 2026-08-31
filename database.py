@@ -13,6 +13,14 @@ SCHEMA_VERSION = 2
 # queries so a busy region can never trip it.
 _SQLITE_MAX_VARIABLES = 900
 
+# Every function in this module is fully synchronous (no `await` inside), and
+# PTB dispatches both its handlers and its JobQueue jobs on the same single
+# event loop (its AsyncIOExecutor schedules onto that loop). So in practice one
+# thread owns one connection and nothing can interleave inside a transaction.
+# That safety comes from PTB's threading model, not from anything enforced
+# here: a caller that runs these functions from another thread gets its own
+# connection, and one that runs them concurrently in the same thread would not
+# be protected.
 _local = threading.local()
 
 
@@ -254,8 +262,9 @@ def get_subscribers_with_min_rank(region_code: str) -> list[tuple[int, int]]:
     """Return (user_id, min_rank) for every subscriber of region_code.
 
     min_rank is the integer rank of the user's minimum level, defaulting to
-    the rank of config.DEFAULT_MIN_LEVEL for users with no preference row.
-    The level-to-rank mapping is applied in Python via config.LEVEL_RANK.
+    the rank of config.DEFAULT_MIN_LEVEL for users with no preference row or
+    an unrecognised stored value. The mapping lives in config.rank_for, which
+    handlers.py uses too, so the rule has exactly one definition.
     """
     conn = _connect()
     rows = conn.execute(
@@ -268,11 +277,4 @@ def get_subscribers_with_min_rank(region_code: str) -> list[tuple[int, int]]:
         (region_code,),
     ).fetchall()
 
-    default_rank = config.LEVEL_RANK[config.DEFAULT_MIN_LEVEL]
-
-    def _rank(min_level: str | None) -> int:
-        if min_level is None:
-            return default_rank
-        return config.LEVEL_RANK.get(min_level, default_rank)
-
-    return [(user_id, _rank(min_level)) for user_id, min_level in rows]
+    return [(user_id, config.rank_for(min_level)) for user_id, min_level in rows]

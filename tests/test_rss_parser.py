@@ -138,6 +138,27 @@ def test_parsing_madrid_sin_avisos_feed_yields_no_alerts(read_fixture):
     assert alerts == []
 
 
+def test_summary_item_is_skipped_by_its_guid_even_if_aemet_rewords_the_title():
+    """Belt and braces: the summary is a .tar.gz, every real alert is a .xml.
+
+    Such an item carries no level word, so it would rank UNKNOWN_LEVEL_RANK
+    and be pushed to every subscriber, even min_level="rojo" ones.
+    """
+    data = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+<title>AEMET - Avisos - Madrid</title>
+<item>
+<title>Resumen general de avisos para Madrid</title>
+<description>Fichero tar.gz que contiene todos los avisos para Madrid.</description>
+<link>https://www.aemet.es/x/Z_CAP_C_LEMM_20260829215001_AFAP7228.tar.gz</link>
+<guid>Z_CAP_C_LEMM_20260829215001_AFAP7228.tar.gz</guid>
+<pubDate>2026-08-29T21:50:01+00:00</pubDate>
+</item>
+</channel></rss>"""
+
+    assert _parse_feed_bytes(data, "source") == []
+
+
 # --- RSS index page scraping ---------------------------------------------
 
 
@@ -203,6 +224,8 @@ def test_level_rank_follows_severity_order_and_unknown_is_maximal():
         ),
         ("Aviso. Nivel naranja. Viento. Costa de Huelva", "Costa de Huelva"),
         ("Aviso. Nivel rojo. Lluvias. Pirineo Occidental", "Pirineo Occidental"),
+        # A title that ends in a period keeps neither it nor an empty tail.
+        ("Aviso. Nivel amarillo. Viento. Costa de Huelva.", "Costa de Huelva"),
         ("Aviso. Nivel rojo. Lluvia", None),
     ],
 )
@@ -239,6 +262,20 @@ def test_parse_validity_parses_real_cordoba_description():
 )
 def test_parse_validity_returns_none_pair_for_missing_or_malformed_input(description):
     assert _parse_validity(description) == (None, None)
+
+
+def test_parse_validity_treats_a_bare_utc_as_offset_zero():
+    """Peninsular winter and the Canary Islands publish a bare "(UTC)"."""
+    description = (
+        "Aviso de viento de 10:00 01-01-2026 GMT (UTC) a 12:00 01-01-2026 GMT (UTC)."
+    )
+
+    starts_at, ends_at = _parse_validity(description)
+
+    assert starts_at == datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
+    assert ends_at == datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    assert starts_at.utcoffset() == timedelta(0)
+    assert ends_at.utcoffset() == timedelta(0)
 
 
 def test_parse_validity_handles_negative_utc_offset():
