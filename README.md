@@ -147,23 +147,48 @@ sudo systemctl enable --now aemet-avisos-bot
 
 The unit runs as the unprivileged `aemetbot` user, restarts automatically on failure, and locks down the filesystem (`ProtectSystem=strict`) with a single writable exception for `/opt/aemet-avisos-bot` — where `subscriptions.db` (the default `DATABASE_PATH`, resolved relative to `WorkingDirectory`) lives.
 
-### Automatic updates (optional)
+### Updating a running deployment
 
-`deploy/update.sh` plus a systemd timer keeps the server in step with the deployment branch, without the server ever accepting an inbound connection or GitHub holding a key to it. Every five minutes the timer fetches the branch; when it finds a new commit **whose CI has passed**, it fast-forwards, reinstalls dependencies and restarts the bot.
+`deploy/update.sh` moves the server from the version it is running to the tip of the deployment branch. You run it when you want the update; nothing deploys on its own.
+
+Install it once, alongside the unit above:
 
 ```bash
 sudo cp deploy/aemet-avisos-bot-update.service /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+
+Then deploy whenever you like:
+
+```bash
+sudo systemctl start aemet-avisos-bot-update.service   # deploy now
+journalctl -u aemet-avisos-bot-update -n 20            # what it did
+```
+
+Each run fetches the branch and stops there unless there is something to do. When it finds a new commit it checks that **the commit's CI has passed**, fast-forwards to it, reinstalls dependencies, and restarts the bot — in that order, so a red build never reaches the server.
+
+It is deliberately conservative and **fails closed**. An unreachable GitHub API, a commit with no CI results, a red build, or a checkout that has diverged locally all leave the running version alone rather than guessing. A run that finds nothing new prints nothing at all, so the journal only ever contains real deployments.
+
+Because the server pulls, it never accepts an inbound connection for deployment and GitHub holds no credentials for it.
+
+#### Making it automatic
+
+A timer ships alongside the service and is **not enabled by default**. Enabling it turns the manual step above into a check every five minutes:
+
+```bash
 sudo cp deploy/aemet-avisos-bot-update.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now aemet-avisos-bot-update.timer
 
 systemctl list-timers aemet-avisos-bot-update.timer   # when it next runs
-journalctl -u aemet-avisos-bot-update -f              # what it did
+sudo systemctl disable --now aemet-avisos-bot-update.timer   # back to manual
 ```
 
-It is deliberately conservative and fails closed — an unreachable GitHub API, a commit with no CI results, a red build, or a locally diverged checkout all leave the running version alone. A run that finds nothing new prints nothing, so the journal only ever shows real events.
+Change the interval by editing `OnUnitActiveSec` in the timer file. Nothing else differs: the timer runs exactly the same service, with the same safety rules.
 
-Tune it with a drop-in (`sudo systemctl edit aemet-avisos-bot-update.service`):
+#### Configuration
+
+Tune either mode with a drop-in (`sudo systemctl edit aemet-avisos-bot-update.service`):
 
 | Variable | Meaning | Default |
 |---|---|---|
@@ -174,7 +199,18 @@ Tune it with a drop-in (`sudo systemctl edit aemet-avisos-bot-update.service`):
 | `API_REPO` | `owner/name` used for the CI lookup | `jaimebg/aemet-avisos-bot` |
 | `REQUIRE_GREEN_CI` | Set to `0` to deploy without consulting CI | `1` |
 
-Change the interval by editing `OnUnitActiveSec` in the timer, and run a deploy immediately with `sudo systemctl start aemet-avisos-bot-update.service`.
+The updater runs as root so it can restart the unit, and drops to `RUN_AS` for every write to the checkout — git refuses to work in a repository owned by another user, so all of its commands go through that account.
+
+#### Rolling back
+
+There is no rollback command; `git` is the rollback. To get a bad release off the server right now:
+
+```bash
+sudo -u aemetbot git -C /opt/aemet-avisos-bot checkout <good-commit>
+sudo systemctl restart aemet-avisos-bot
+```
+
+**This is a stopgap, not a pin.** The checkout is left detached at an ancestor of the branch, and `git merge --ff-only` advances an ancestor happily — so the next update run rolls the server forward onto the bad commit again. Use the pause to fix forward: revert the offending commit on the branch and deploy that. If you need the server to hold still in the meantime, stop the updater from running rather than relying on the checkout to resist it.
 
 > **The database is not backed up before an update.** The schema migration runs once and is idempotent afterwards, so the exposure is small, but `subscriptions.db` holds every user's subscriptions — copy it somewhere safe before a release you have doubts about.
 
