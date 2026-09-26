@@ -17,6 +17,7 @@ from telegram.warnings import PTBDeprecationWarning
 
 import bot
 import database
+import rss_parser
 from rss_parser import Alert
 
 CANONICAL_ID = "AFAZ611402ATTA3119.xml"
@@ -83,13 +84,12 @@ class FakeContext:
 
 
 class FakeClient:
-    """Async context manager standing in for the httpx client."""
+    """Stands in for the shared httpx client; the fetcher never uses it."""
 
-    async def __aenter__(self) -> FakeClient:
-        return self
+    is_closed = False
 
-    async def __aexit__(self, *exc_info: object) -> bool:
-        return False
+    async def aclose(self) -> None:
+        self.is_closed = True
 
 
 class FakeFetcher:
@@ -112,7 +112,7 @@ class FakeFetcher:
 def fetcher(monkeypatch):
     """Replace the network layer entirely: no HTTP happens in these tests."""
     fake = FakeFetcher()
-    monkeypatch.setattr(bot, "build_client", FakeClient)
+    monkeypatch.setattr(rss_parser, "build_client", FakeClient)
     monkeypatch.setattr(bot, "fetch_alerts_for_regions", fake)
     return fake
 
@@ -489,7 +489,7 @@ async def test_region_without_alerts_is_skipped_without_querying_the_database(
 async def test_send_alert_return_value_for_success_and_each_caught_error(
     temp_db, fake_bot
 ):
-    assert await bot._send_alert(fake_bot, 1, "hola") is True
+    assert await bot._send_alert(fake_bot, 1, "hola") is bot.SendResult.DELIVERED
     assert fake_bot.sent == [(1, "hola")]
 
     with warnings.catch_warnings():
@@ -508,8 +508,196 @@ async def test_send_alert_return_value_for_success_and_each_caught_error(
         10: TelegramError("connection reset"),
     }
 
-    assert await bot._send_alert(fake_bot, 7, "hola") is False
+    database.set_min_level(7, "rojo")
+    assert await bot._send_alert(fake_bot, 7, "hola") is bot.SendResult.REJECTED
     assert database.get_user_subscriptions(7) == []
-    assert await bot._send_alert(fake_bot, 8, "hola") is False
-    assert await bot._send_alert(fake_bot, 9, "hola") is False
-    assert await bot._send_alert(fake_bot, 10, "hola") is False
+    # A blocked user is forgotten entirely, preferences included.
+    assert database.get_min_level(7) == "amarillo"
+    assert await bot._send_alert(fake_bot, 8, "hola") is bot.SendResult.REJECTED
+    assert await bot._send_alert(fake_bot, 9, "hola") is bot.SendResult.FAILED
+    assert await bot._send_alert(fake_bot, 10, "hola") is bot.SendResult.FAILED
+
+
+# --- retry queue for partial deliveries ------------------------------------
+
+
+async def test_partial_delivery_queues_the_missed_user_and_retries_only_them(
+    temp_db, fetcher, context, fake_bot
+):
+    database.add_subscription(1, "and")
+    database.add_subscription(2, "and")
+    fake_bot.errors = {1: TelegramError("timeout")}
+    fetcher.alerts_by_region = {"and": [make_alert("naranja")]}
+
+    await bot.poll_alerts(context)
+
+    assert fake_bot.recipients() == [2]
+    assert database.get_failed_deliveries([CANONICAL_ID]) == {CANONICAL_ID: [(1, None)]}
+
+    fake_bot.errors = {}
+    await bot.poll_alerts(context)
+
+    # Only the user it missed gets it; user 2 is not notified twice.
+    assert fake_bot.recipients() == [2, 1]
+    assert database.get_failed_deliveries([CANONICAL_ID]) == {}
+
+    await bot.poll_alerts(context)
+    assert fake_bot.recipients() == [2, 1]
+
+
+async def test_a_retry_that_fails_again_stays_queued(
+    temp_db, fetcher, context, fake_bot
+):
+    database.add_subscription(1, "and")
+    database.add_subscription(2, "and")
+    fake_bot.errors = {1: TelegramError("timeout")}
+    fetcher.alerts_by_region = {"and": [make_alert("naranja")]}
+
+    await bot.poll_alerts(context)
+    await bot.poll_alerts(context)
+
+    assert fake_bot.recipients() == [2]
+    assert database.get_failed_deliveries([CANONICAL_ID]) == {CANONICAL_ID: [(1, None)]}
+
+
+async def test_retry_is_dropped_when_the_user_no_longer_wants_the_alert(
+    temp_db, fetcher, context, fake_bot
+):
+    database.add_subscription(1, "and")
+    database.add_subscription(2, "and")
+    fake_bot.errors = {1: TelegramError("timeout")}
+    fetcher.alerts_by_region = {"and": [make_alert("naranja")]}
+    await bot.poll_alerts(context)
+
+    database.set_min_level(1, "rojo")
+    fake_bot.errors = {}
+    await bot.poll_alerts(context)
+
+    assert fake_bot.recipients() == [2]
+    assert database.get_failed_deliveries([CANONICAL_ID]) == {}
+
+
+async def test_escalation_supersedes_a_queued_retry_of_the_lower_level(
+    temp_db, fetcher, context, fake_bot
+):
+    database.add_subscription(1, "and")
+    database.add_subscription(2, "and")
+    fake_bot.errors = {1: TelegramError("timeout")}
+    fetcher.alerts_by_region = {"and": [make_alert("amarillo")]}
+    await bot.poll_alerts(context)
+    fake_bot.sent.clear()
+
+    fake_bot.errors = {}
+    fetcher.alerts_by_region = {
+        "and": [make_alert("rojo", published_at="20260224180000")]
+    }
+    await bot.poll_alerts(context)
+
+    # One escalation message each; no stale yellow retry for user 1.
+    assert sorted(fake_bot.recipients()) == [1, 2]
+    assert all("AMARILLO → ROJO" in text for _, text in fake_bot.sent)
+    assert database.get_failed_deliveries([CANONICAL_ID]) == {}
+
+
+async def test_retry_of_an_escalation_keeps_the_escalation_header(
+    temp_db, fetcher, context, fake_bot
+):
+    database.add_subscription(1, "and")
+    database.add_subscription(2, "and")
+    fetcher.alerts_by_region = {"and": [make_alert("amarillo")]}
+    await bot.poll_alerts(context)
+    fake_bot.sent.clear()
+
+    fake_bot.errors = {1: TelegramError("timeout")}
+    fetcher.alerts_by_region = {
+        "and": [make_alert("rojo", published_at="20260224180000")]
+    }
+    await bot.poll_alerts(context)
+    fake_bot.errors = {}
+    await bot.poll_alerts(context)
+
+    assert "AMARILLO → ROJO" in fake_bot.messages_for(1)[0]
+
+
+# --- feed health -------------------------------------------------------------
+
+
+class NoneFetcher(FakeFetcher):
+    """A fetcher for which every region is unreadable."""
+
+    async def __call__(self, region_codes, client):
+        self.calls += 1
+        return dict.fromkeys(region_codes)
+
+
+async def test_unreadable_region_is_skipped_without_error(
+    temp_db, context, fake_bot, monkeypatch
+):
+    database.add_subscription(1, "and")
+    monkeypatch.setattr(rss_parser, "build_client", FakeClient)
+    monkeypatch.setattr(bot, "fetch_alerts_for_regions", NoneFetcher())
+
+    await bot.poll_alerts(context)
+
+    assert fake_bot.sent == []
+    assert context.bot_data[bot.FEED_FAILURE_STREAK_KEY] == 1
+
+
+async def test_admin_is_told_once_after_consecutive_total_failures_and_on_recovery(
+    temp_db, fetcher, context, fake_bot, monkeypatch
+):
+    admin = 999
+    monkeypatch.setattr(bot, "ADMIN_CHAT_ID", admin)
+    monkeypatch.setattr(bot, "FEED_FAILURE_ALERT_CYCLES", 2)
+    database.add_subscription(1, "and")
+    monkeypatch.setattr(bot, "fetch_alerts_for_regions", NoneFetcher())
+
+    for _ in range(4):
+        await bot.poll_alerts(context)
+
+    assert len(fake_bot.messages_for(admin)) == 1
+    assert "4" not in fake_bot.messages_for(admin)[0]
+
+    monkeypatch.setattr(bot, "fetch_alerts_for_regions", fetcher)
+    await bot.poll_alerts(context)
+    await bot.poll_alerts(context)
+
+    assert len(fake_bot.messages_for(admin)) == 2
+    assert "vuelve a responder" in fake_bot.messages_for(admin)[1]
+    assert context.bot_data[bot.FEED_FAILURE_STREAK_KEY] == 0
+
+
+async def test_short_outage_below_threshold_notifies_nobody(
+    temp_db, fetcher, context, fake_bot, monkeypatch
+):
+    monkeypatch.setattr(bot, "ADMIN_CHAT_ID", 999)
+    monkeypatch.setattr(bot, "FEED_FAILURE_ALERT_CYCLES", 3)
+    database.add_subscription(1, "and")
+    monkeypatch.setattr(bot, "fetch_alerts_for_regions", NoneFetcher())
+    await bot.poll_alerts(context)
+    monkeypatch.setattr(bot, "fetch_alerts_for_regions", fetcher)
+    await bot.poll_alerts(context)
+
+    assert fake_bot.sent == []
+
+
+async def test_poll_reuses_one_http_client_across_cycles(
+    temp_db, fetcher, context, monkeypatch
+):
+    database.add_subscription(1, "and")
+    clients: list[object] = []
+
+    async def recording_fetch(region_codes, client):
+        clients.append(client)
+        return {code: [] for code in region_codes}
+
+    monkeypatch.setattr(bot, "fetch_alerts_for_regions", recording_fetch)
+    await bot.poll_alerts(context)
+    await bot.poll_alerts(context)
+
+    assert len(clients) == 2
+    assert clients[0] is clients[1]
+
+    await bot.post_shutdown(context)
+    assert clients[0].is_closed
+    assert rss_parser.HTTP_CLIENT_KEY not in context.bot_data

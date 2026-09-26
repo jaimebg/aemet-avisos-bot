@@ -24,6 +24,12 @@ API_REPO=${API_REPO:-jaimebg/aemet-avisos-bot}
 # Set to 0 to deploy whatever is on the branch without consulting CI.
 REQUIRE_GREEN_CI=${REQUIRE_GREEN_CI:-1}
 
+# Records the last commit that was fully deployed: dependencies installed,
+# checkout moved and service restarted. It is written only after all three
+# succeed, so a run that dies half-way is retried by the next one instead of
+# being mistaken for finished because HEAD already moved.
+DEPLOYED_REF=refs/deploy/current
+
 log() { printf '%s\n' "$*"; }
 
 # Run a command as the service account, so repository files never end up owned
@@ -76,6 +82,26 @@ sys.exit(0 if all(
 '
 }
 
+# The last fully deployed commit. Before the first run that records one, the
+# checked-out commit is the best available answer.
+deployed_commit() {
+    as_service_account git rev-parse --verify --quiet "${DEPLOYED_REF}^{commit}" \
+        || as_service_account git rev-parse HEAD
+}
+
+# Install the dependencies of a commit that is not checked out yet. Done before
+# the checkout moves, so a failed install leaves code and dependencies matching.
+install_requirements() {
+    local commit=$1 reqs
+    reqs=$(as_service_account mktemp)
+    # shellcheck disable=SC2064  # expand $reqs now; it is local to this call
+    trap "rm -f '$reqs'" EXIT
+    as_service_account git show "${commit}:requirements.txt" >"$reqs"
+    as_service_account .venv/bin/pip install --quiet --requirement "$reqs"
+    rm -f "$reqs"
+    trap - EXIT
+}
+
 main() {
     cd "$REPO_DIR"
 
@@ -85,7 +111,7 @@ main() {
     # ones: git refuses to operate on a repository owned by another user
     # ("dubious ownership"), and this script normally runs as root.
     local current target
-    current=$(as_service_account git rev-parse HEAD)
+    current=$(deployed_commit)
     target=$(as_service_account git rev-parse "origin/${BRANCH}")
 
     # Nothing new. Stay silent, or the journal fills with one entry per run.
@@ -98,11 +124,13 @@ main() {
         exit 0
     fi
 
+    install_requirements "$target"
     # --ff-only so a locally diverged checkout aborts the deploy rather than
-    # silently creating a merge commit on the server.
-    as_service_account git merge --ff-only "origin/${BRANCH}"
-    as_service_account .venv/bin/pip install --quiet --requirement requirements.txt
+    # silently creating a merge commit on the server. Merging onto a checkout
+    # an interrupted run already advanced is a harmless no-op.
+    as_service_account git merge --ff-only "$target"
     restart_service
+    as_service_account git update-ref "$DEPLOYED_REF" "$target"
 
     log "Deployed ${target:0:7}."
 }

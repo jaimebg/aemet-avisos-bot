@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from enum import Enum
 
 from telegram import Bot, BotCommand
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
@@ -12,11 +13,15 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 import config
 from config import (
+    ADMIN_CHAT_ID,
     CLEANUP_INTERVAL_SECONDS,
+    FEED_FAILURE_ALERT_CYCLES,
     LEVEL_RANK,
     POLL_INTERVAL_SECONDS,
     SEEN_RETENTION_DAYS,
@@ -25,12 +30,16 @@ from config import (
 )
 from database import (
     cleanup_old_alerts,
+    clear_failed_deliveries,
+    clear_failed_delivery,
+    forget_user,
+    get_failed_deliveries,
     get_seen_levels,
     get_subscribed_regions,
     get_subscribers_with_min_rank,
     init_db,
     mark_alert_seen,
-    remove_all_subscriptions,
+    record_failed_delivery,
     update_alert_level,
 )
 from handlers import (
@@ -39,17 +48,36 @@ from handlers import (
     help_command,
     level_command,
     my_subscriptions_command,
+    private_only_command,
     start_command,
     subscribe_command,
     unsubscribe_command,
 )
-from rss_parser import Alert, build_client, fetch_alerts_for_regions
+from rss_parser import (
+    Alert,
+    close_shared_client,
+    fetch_alerts_for_regions,
+    shared_client,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# bot_data key: consecutive poll cycles in which no subscribed region could be
+# read at all.
+FEED_FAILURE_STREAK_KEY = "feed_failure_streak"
+
+
+class SendResult(Enum):
+    DELIVERED = "delivered"
+    # Permanent for this message: the user blocked the bot, or Telegram
+    # refused the message itself. Retrying would fail the same way.
+    REJECTED = "rejected"
+    # Transient (flood control, network): worth retrying on a later cycle.
+    FAILED = "failed"
 
 
 def _stored_rank(level: str | None) -> int:
@@ -62,8 +90,8 @@ def _stored_rank(level: str | None) -> int:
     return LEVEL_RANK.get(level or "", 0)
 
 
-async def _send_alert(bot: Bot, user_id: int, message: str) -> bool:
-    """Send one alert to one user. Returns True when it was delivered.
+async def _send_alert(bot: Bot, user_id: int, message: str) -> SendResult:
+    """Send one alert to one user and classify the outcome.
 
     Never raises: every Telegram failure mode is caught and reported here so
     one bad recipient can never abort delivery to the rest.
@@ -72,11 +100,11 @@ async def _send_alert(bot: Bot, user_id: int, message: str) -> bool:
         await bot.send_message(chat_id=user_id, text=message, parse_mode="HTML")
     except Forbidden:
         logger.info(
-            "User %d blocked the bot or the chat is gone; removing subscriptions",
+            "User %d blocked the bot or the chat is gone; forgetting the user",
             user_id,
         )
-        remove_all_subscriptions(user_id)
-        return False
+        forget_user(user_id)
+        return SendResult.REJECTED
     except BadRequest as exc:
         # Include the message text: this is how a formatting bug gets diagnosed.
         logger.error(
@@ -85,26 +113,33 @@ async def _send_alert(bot: Bot, user_id: int, message: str) -> bool:
             exc,
             message,
         )
-        return False
+        return SendResult.REJECTED
     except RetryAfter as exc:
         # The rate limiter normally absorbs these; if one still surfaces the
-        # alert is simply retried on the next cycle (see the D3 rule).
+        # alert is retried on a later cycle (the D3 rule, or the retry queue).
         logger.warning("Flood control for user %d: %s", user_id, exc)
-        return False
+        return SendResult.FAILED
     except TelegramError as exc:
         logger.warning("Could not send alert to user %d: %s", user_id, exc)
-        return False
-    return True
+        return SendResult.FAILED
+    return SendResult.DELIVERED
 
 
 async def _deliver_region_alerts(
     bot: Bot, region_code: str, alerts: list[Alert]
 ) -> None:
-    """Deliver the new and escalated alerts of one region and record them."""
+    """Deliver the new and escalated alerts of one region and record them.
+
+    Also retries queued deliveries of alerts already recorded: when an alert
+    reached some subscribers but not others, the ones it missed transiently
+    are queued in failed_deliveries and retried here while the alert lasts.
+    """
     seen = get_seen_levels([a.canonical_id for a in alerts])
 
     # (alert, previous_level, is_new) for every alert worth delivering.
     pending: list[tuple[Alert, str | None, bool]] = []
+    # Recorded alerts that are not being re-sent; candidates for retries.
+    settled: list[Alert] = []
     for alert in alerts:
         if alert.canonical_id not in seen:
             pending.append((alert, None, True))
@@ -118,8 +153,11 @@ async def _deliver_region_alerts(
         if alert.level is not None and alert.level_rank > _stored_rank(stored_level):
             # AEMET republished the alert at a higher level: notify again.
             pending.append((alert, stored_level, False))
+        else:
+            settled.append(alert)
 
-    if not pending:
+    retries = get_failed_deliveries([a.canonical_id for a in settled])
+    if not pending and not retries:
         return
 
     recipients = get_subscribers_with_min_rank(region_code)
@@ -138,14 +176,18 @@ async def _deliver_region_alerts(
                 if min_rank <= alert.level_rank
             ]
 
+            failed: list[int] = []
             delivered = 0
             if eligible:
                 message = alert.format_message(
                     region_code, previous_level=previous_level
                 )
                 for user_id in eligible:
-                    if await _send_alert(bot, user_id, message):
+                    result = await _send_alert(bot, user_id, message)
+                    if result is SendResult.DELIVERED:
                         delivered += 1
+                    elif result is SendResult.FAILED:
+                        failed.append(user_id)
 
                 if delivered == 0:
                     logger.warning(
@@ -161,9 +203,52 @@ async def _deliver_region_alerts(
                 mark_alert_seen(alert.canonical_id, alert.level)
             else:
                 update_alert_level(alert.canonical_id, alert.level)
+                # Retries of the lower-level message are superseded: everyone
+                # eligible for it was just sent the escalation instead.
+                clear_failed_deliveries(alert.canonical_id)
+            for user_id in failed:
+                record_failed_delivery(alert.canonical_id, user_id, previous_level)
         except Exception:
             logger.exception(
                 "Error delivering alert %s for region %s",
+                alert.canonical_id,
+                region_code,
+            )
+
+    if retries:
+        await _retry_failed_deliveries(bot, region_code, settled, retries, recipients)
+
+
+async def _retry_failed_deliveries(
+    bot: Bot,
+    region_code: str,
+    alerts: list[Alert],
+    retries: dict[str, list[tuple[int, str | None]]],
+    recipients: list[tuple[int, int]],
+) -> None:
+    """Resend recorded alerts to the users a previous delivery missed."""
+    min_rank_by_user = dict(recipients)
+    for alert in alerts:
+        queued = retries.get(alert.canonical_id)
+        if not queued:
+            continue
+        try:
+            for user_id, previous_level in queued:
+                min_rank = min_rank_by_user.get(user_id)
+                if min_rank is None or min_rank > alert.level_rank:
+                    # Unsubscribed from the region, or raised their minimum
+                    # level since: they no longer want this alert.
+                    clear_failed_delivery(alert.canonical_id, user_id)
+                    continue
+                message = alert.format_message(
+                    region_code, previous_level=previous_level
+                )
+                result = await _send_alert(bot, user_id, message)
+                if result is not SendResult.FAILED:
+                    clear_failed_delivery(alert.canonical_id, user_id)
+        except Exception:
+            logger.exception(
+                "Error retrying alert %s for region %s",
                 alert.canonical_id,
                 region_code,
             )
@@ -204,8 +289,10 @@ async def poll_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not regions:
         return
 
-    async with build_client() as client:
-        alerts_by_region = await fetch_alerts_for_regions(regions, client)
+    alerts_by_region = await fetch_alerts_for_regions(
+        regions, shared_client(context.bot_data)
+    )
+    await _track_feed_health(context, alerts_by_region)
 
     for region_code, alerts in alerts_by_region.items():
         if not alerts:
@@ -218,6 +305,59 @@ async def poll_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
             # seen-levels and subscriber lookups) so one misbehaving region
             # still cannot abort the whole cycle.
             logger.exception("Error processing alerts for region %s", region_code)
+
+
+async def _notify_admin(bot: Bot, text: str) -> None:
+    """Best-effort message to ADMIN_CHAT_ID; a no-op when it is not set."""
+    if not ADMIN_CHAT_ID:
+        return
+    try:
+        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
+    except TelegramError as exc:
+        logger.warning("Could not notify the admin chat: %s", exc)
+
+
+async def _track_feed_health(
+    context: ContextTypes.DEFAULT_TYPE, alerts_by_region: dict[str, list[Alert] | None]
+) -> None:
+    """Make a total AEMET outage loud instead of indistinguishable from calm.
+
+    A cycle in which no subscribed region could be read (AEMET down, or its
+    markup changed under _RSS_LINK_RE) would otherwise look exactly like a
+    cycle with no alerts. After FEED_FAILURE_ALERT_CYCLES such cycles in a row
+    this logs an error and tells the admin chat, once; the first cycle that
+    reads anything again reports the recovery.
+    """
+    streak = int(context.bot_data.get(FEED_FAILURE_STREAK_KEY, 0))
+    total_failure = bool(alerts_by_region) and all(
+        alerts is None for alerts in alerts_by_region.values()
+    )
+
+    if not total_failure:
+        if streak >= FEED_FAILURE_ALERT_CYCLES:
+            logger.info("AEMET feeds readable again after %d failed cycle(s)", streak)
+            await _notify_admin(
+                context.bot,
+                f"✅ AEMET vuelve a responder tras {streak} ciclo(s) fallidos.",
+            )
+        context.bot_data[FEED_FAILURE_STREAK_KEY] = 0
+        return
+
+    streak += 1
+    context.bot_data[FEED_FAILURE_STREAK_KEY] = streak
+    if streak == FEED_FAILURE_ALERT_CYCLES:
+        logger.error(
+            "No subscribed region could be read for %d consecutive cycle(s); "
+            "no alerts are being delivered",
+            streak,
+        )
+        await _notify_admin(
+            context.bot,
+            f"⚠️ No se ha podido leer ningún feed de AEMET en {streak} ciclos "
+            "seguidos. No se están enviando avisos. Revisa los logs.",
+        )
+    else:
+        logger.warning("No subscribed region could be read (cycle %d)", streak)
 
 
 async def post_init(app: Application) -> None:
@@ -233,6 +373,11 @@ async def post_init(app: Application) -> None:
             BotCommand("ayuda", "Ayuda"),
         ]
     )
+
+
+async def post_shutdown(app: Application) -> None:
+    """Close the long-lived HTTP client opened by the polling job or /avisos."""
+    await close_shared_client(app.bot_data)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -258,17 +403,25 @@ def main() -> None:
         .token(TELEGRAM_TOKEN)
         .rate_limiter(AIORateLimiter())
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
-    # Commands
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("ayuda", help_command))
-    app.add_handler(CommandHandler("suscribir", subscribe_command))
-    app.add_handler(CommandHandler("desuscribir", unsubscribe_command))
-    app.add_handler(CommandHandler("mis_avisos", my_subscriptions_command))
-    app.add_handler(CommandHandler("avisos", current_alerts_command))
-    app.add_handler(CommandHandler("nivel", level_command))
+    # Commands. Private chats only: subscriptions are per user and alerts go
+    # to the user's private chat, so a subscription made from a group would
+    # target a chat the bot may not be allowed to open -- the first alert
+    # would fail with Forbidden and silently erase it.
+    private = filters.ChatType.PRIVATE
+    app.add_handler(CommandHandler("start", start_command, filters=private))
+    app.add_handler(CommandHandler("ayuda", help_command, filters=private))
+    app.add_handler(CommandHandler("suscribir", subscribe_command, filters=private))
+    app.add_handler(CommandHandler("desuscribir", unsubscribe_command, filters=private))
+    app.add_handler(
+        CommandHandler("mis_avisos", my_subscriptions_command, filters=private)
+    )
+    app.add_handler(CommandHandler("avisos", current_alerts_command, filters=private))
+    app.add_handler(CommandHandler("nivel", level_command, filters=private))
+    app.add_handler(MessageHandler(filters.COMMAND & ~private, private_only_command))
 
     # Inline button callbacks
     app.add_handler(CallbackQueryHandler(callback_handler))

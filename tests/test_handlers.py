@@ -13,6 +13,7 @@ import pytest
 
 import database
 import handlers
+import rss_parser
 from config import REGIONS
 from rss_parser import Alert
 
@@ -107,13 +108,12 @@ class FakeContext:
 
 
 class FakeClient:
-    """Async context manager standing in for the httpx client."""
+    """Stands in for the shared httpx client; the fetcher never uses it."""
 
-    async def __aenter__(self) -> FakeClient:
-        return self
+    is_closed = False
 
-    async def __aexit__(self, *exc_info: object) -> bool:
-        return False
+    async def aclose(self) -> None:
+        self.is_closed = True
 
 
 class FakeFetcher:
@@ -141,7 +141,7 @@ def context() -> FakeContext:
 def fetcher(monkeypatch):
     """Replace the network layer entirely: no HTTP happens in these tests."""
     fake = FakeFetcher()
-    monkeypatch.setattr(handlers, "build_client", FakeClient)
+    monkeypatch.setattr(rss_parser, "build_client", FakeClient)
     monkeypatch.setattr(handlers, "fetch_alerts_for_regions", fake)
     return fake
 
@@ -451,7 +451,7 @@ async def test_avisos_is_refused_while_the_same_user_already_has_one_in_flight(
         await release.wait()
         return {code: [] for code in region_codes}
 
-    monkeypatch.setattr(handlers, "build_client", FakeClient)
+    monkeypatch.setattr(rss_parser, "build_client", FakeClient)
     monkeypatch.setattr(handlers, "fetch_alerts_for_regions", slow_fetch)
 
     first_msg = FakeMessage()
@@ -505,7 +505,7 @@ async def test_avisos_releases_the_in_flight_guard_when_the_lookup_raises(
     async def exploding_fetch(region_codes, client):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(handlers, "build_client", FakeClient)
+    monkeypatch.setattr(rss_parser, "build_client", FakeClient)
     monkeypatch.setattr(handlers, "fetch_alerts_for_regions", exploding_fetch)
 
     with pytest.raises(RuntimeError):
@@ -514,3 +514,74 @@ async def test_avisos_releases_the_in_flight_guard_when_the_lookup_raises(
         )
 
     assert context.bot_data[handlers.AVISOS_IN_FLIGHT_KEY] == set()
+
+
+# --- review fixes --------------------------------------------------------
+
+
+async def test_subscribe_callback_with_an_unknown_region_is_ignored(temp_db):
+    query = FakeCallbackQuery(f"{handlers.CB_SUBSCRIBE}../../etc", 1)
+    update = FakeUpdate(callback_query=query)
+
+    await handlers.callback_handler(update, None)
+
+    assert query.answered
+    assert query.edited_texts == []
+    assert database.get_user_subscriptions(1) == []
+    assert database.get_subscribed_regions() == []
+
+
+class PartlyUnreachableFetcher(FakeFetcher):
+    def __init__(self, unreachable: set[str]) -> None:
+        super().__init__()
+        self.unreachable = unreachable
+
+    async def __call__(self, region_codes, client):
+        result = await super().__call__(region_codes, client)
+        for code in self.unreachable:
+            if code in result:
+                result[code] = None
+        return result
+
+
+async def test_avisos_does_not_claim_all_clear_when_aemet_is_unreachable(
+    temp_db, context, monkeypatch
+):
+    database.add_subscription(1, "mad")
+    monkeypatch.setattr(rss_parser, "build_client", FakeClient)
+    monkeypatch.setattr(
+        handlers, "fetch_alerts_for_regions", PartlyUnreachableFetcher({"mad"})
+    )
+    update = FakeUpdate(message=FakeMessage(), user=FakeUser(1))
+
+    await handlers.current_alerts_command(update, context)
+
+    placeholder = update.effective_message.replies[0]
+    assert placeholder.edited_texts == [handlers.AVISOS_UNREACHABLE_TEXT]
+
+
+async def test_avisos_names_the_regions_it_could_not_read(
+    temp_db, context, monkeypatch
+):
+    database.add_subscription(1, "mad")
+    database.add_subscription(1, "and")
+    monkeypatch.setattr(rss_parser, "build_client", FakeClient)
+    monkeypatch.setattr(
+        handlers, "fetch_alerts_for_regions", PartlyUnreachableFetcher({"mad"})
+    )
+    update = FakeUpdate(message=FakeMessage(), user=FakeUser(1))
+
+    await handlers.current_alerts_command(update, context)
+
+    text = update.effective_message.replies[0].edited_texts[0]
+    assert "No hay avisos activos" in text
+    assert "No se pudo consultar: Madrid" in text
+    assert "Andalucía" not in text
+
+
+async def test_private_only_command_explains_itself():
+    update = FakeUpdate(message=FakeMessage(), user=FakeUser(1))
+
+    await handlers.private_only_command(update, None)
+
+    assert update.effective_message.reply_texts == [handlers.PRIVATE_ONLY_TEXT]

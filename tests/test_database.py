@@ -268,7 +268,7 @@ def test_init_db_migrates_v1_database_in_place(monkeypatch, tmp_path):
     conn = sqlite3.connect(db_path)
     try:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        assert version == 2
+        assert version == database.SCHEMA_VERSION
 
         subs = conn.execute("SELECT user_id, region_code FROM subscriptions").fetchall()
         assert subs == [(1, "mad")]
@@ -298,7 +298,7 @@ def test_init_db_on_already_migrated_database_is_noop(temp_db):
     finally:
         conn.close()
 
-    assert version == 2
+    assert version == database.SCHEMA_VERSION
     assert database.get_user_subscriptions(1) == ["mad"]
     assert database.get_seen_levels(["guid-1"]) == {"guid-1": "amarillo"}
 
@@ -310,3 +310,62 @@ def test_add_subscription_false_on_duplicate_after_other_writes(temp_db):
     assert database.add_subscription(1, "mad") is True
     assert database.add_subscription(2, "and") is True
     assert database.add_subscription(1, "mad") is False
+
+
+# --- retry queue and forget_user ---------------------------------------------
+
+
+def test_failed_deliveries_roundtrip_and_clear(temp_db):
+    database.mark_alert_seen("a.xml", "amarillo")
+    database.record_failed_delivery("a.xml", 2, None)
+    database.record_failed_delivery("a.xml", 1, "amarillo")
+    database.record_failed_delivery("b.xml", 1, None)
+
+    assert database.get_failed_deliveries(["a.xml", "c.xml"]) == {
+        "a.xml": [(1, "amarillo"), (2, None)]
+    }
+    assert database.get_failed_deliveries([]) == {}
+
+    database.clear_failed_delivery("a.xml", 1)
+    assert database.get_failed_deliveries(["a.xml"]) == {"a.xml": [(2, None)]}
+    database.clear_failed_deliveries("a.xml")
+    assert database.get_failed_deliveries(["a.xml"]) == {}
+
+
+def test_cleanup_drops_retries_of_alerts_no_longer_recorded(temp_db):
+    database.mark_alert_seen("kept.xml", "amarillo")
+    database.record_failed_delivery("kept.xml", 1)
+    database.record_failed_delivery("orphan.xml", 1)
+
+    database.cleanup_old_alerts(7)
+
+    assert database.get_failed_deliveries(["kept.xml", "orphan.xml"]) == {
+        "kept.xml": [(1, None)]
+    }
+
+
+def test_forget_user_removes_subscriptions_prefs_and_retries(temp_db):
+    database.add_subscription(1, "and")
+    database.add_subscription(2, "and")
+    database.set_min_level(1, "rojo")
+    database.mark_alert_seen("a.xml", "rojo")
+    database.record_failed_delivery("a.xml", 1)
+
+    database.forget_user(1)
+
+    assert database.get_user_subscriptions(1) == []
+    assert database.get_min_level(1) == "amarillo"
+    assert database.get_failed_deliveries(["a.xml"]) == {}
+    assert database.get_user_subscriptions(2) == ["and"]
+
+
+def test_init_db_upgrades_a_v2_database_to_v3(temp_db):
+    conn = database._connect()
+    conn.execute("DROP TABLE failed_deliveries")
+    conn.execute("PRAGMA user_version = 2")
+    conn.commit()
+
+    database.init_db()
+
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    database.record_failed_delivery("a.xml", 1)

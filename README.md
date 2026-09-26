@@ -26,11 +26,13 @@ AEMET Avisos Bot polls the official [AEMET RSS feeds](https://www.aemet.es/es/rs
 - 🎚️ **Severity levels** — 🟡 yellow / 🟠 orange / 🔴 red with one-tap links to details
 - 🔕 **Per-user severity filtering** — set a minimum level with `/nivel` to stop yellow (or yellow+orange) warnings from reaching you
 - 🔺 **Escalation notifications** — if AEMET upgrades an alert you already received (e.g. yellow → red), you're notified again
-- 🕒 **Validity windows** — an alert message shows exactly when it starts and ends, when AEMET publishes one
-- 📢 **On-demand lookup** — `/avisos` shows what's active right now in your regions, without waiting for the next push
-- 👥 **Per-user subscriptions** — follow as many regions as you want
+- 🕒 **Validity windows** — an alert message shows exactly when it starts and ends, with its time zone (CEST, WEST…), when AEMET publishes one; expired alerts are never sent or shown
+- 📢 **On-demand lookup** — `/avisos` shows what's active right now in your regions, without waiting for the next push, and says so when AEMET can't be reached instead of reporting a false all-clear
+- 🔁 **Retries for missed deliveries** — if an alert reaches some subscribers but fails transiently for others, those others get it on a later cycle
+- 🩺 **Outage alarm** — if no region can be read for several cycles in a row (AEMET down, or its pages changed), the bot logs an error and can tell an admin chat
+- 👥 **Per-user subscriptions** — follow as many regions as you want (the bot works in private chats; in a group it asks you to message it directly)
 - 🧠 **Smart deduplication** — stable alert IDs survive AEMET's GUID churn, so you never get duplicate notifications
-- 🧹 **Self-cleaning** — subscribers who block the bot are pruned automatically, and old alert records age out on a schedule
+- 🧹 **Self-cleaning** — subscribers who block the bot are forgotten automatically, and old alert records age out on a schedule
 - 🗄️ **Zero-config SQLite storage** — no database server needed, with in-place schema migrations
 - ⚡ **Lightweight** — 4 dependencies, runs happily on a Raspberry Pi
 
@@ -83,14 +85,26 @@ All settings live in `.env`:
 | `HTTP_TIMEOUT_SECONDS` | Timeout in seconds for each HTTP request to AEMET | `20` |
 | `HTTP_MAX_CONCURRENCY` | Maximum concurrent HTTP requests to AEMET across all regions | `8` |
 | `HTTP_MAX_RETRIES` | Retries after a failed request (network error or 5xx response) | `2` |
+| `ADMIN_CHAT_ID` | Telegram chat that is told when AEMET has been unreadable for a while, and when it recovers. Send the bot a message and look up your chat id with @userinfobot, for example | `0` (off) |
+| `FEED_FAILURE_ALERT_CYCLES` | Consecutive poll cycles with no readable region before that alarm fires | `3` |
 
 ## 🧪 Development
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -r requirements-dev.txt
+pip install --no-deps -e .
 ```
+
+Dependencies are declared in `pyproject.toml` and pinned in two lock files: `requirements.txt` (runtime, used by Docker and the systemd deployer) and `requirements-dev.txt` (adds the test tools). After changing `pyproject.toml`, regenerate both with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv pip compile pyproject.toml --universal --python-version 3.10 -o requirements.txt
+uv pip compile pyproject.toml --extra dev --universal --python-version 3.10 -o requirements-dev.txt
+```
+
+Add `--upgrade` to move every pin to its latest release.
 
 Run the test suite and the linter before opening a pull request:
 
@@ -100,7 +114,7 @@ ruff check .
 ruff format --check .
 ```
 
-CI (`.github/workflows/ci.yml`) runs the same two checks on Python 3.10 through 3.13 on every push and pull request, plus a `docker build` of the image.
+CI (`.github/workflows/ci.yml`) runs the same checks against the pinned lock on Python 3.10 through 3.13 for every push to `main` and every pull request, checks that the lock files still match `pyproject.toml`, and runs a `docker build` of the image.
 
 ## 📦 Deployment
 
@@ -165,7 +179,9 @@ sudo systemctl start aemet-avisos-bot-update.service   # deploy now
 journalctl -u aemet-avisos-bot-update -n 20            # what it did
 ```
 
-Each run fetches the branch and stops there unless there is something to do. When it finds a new commit it checks that **the commit's CI has passed**, fast-forwards to it, reinstalls dependencies, and restarts the bot — in that order, so a red build never reaches the server.
+Each run fetches the branch and stops there unless there is something to do. When it finds a new commit it checks that **the commit's CI has passed**, installs that commit's pinned dependencies, fast-forwards to it, and restarts the bot — in that order, so a red build never reaches the server and a failed install never leaves new code sitting on old dependencies.
+
+The last fully deployed commit is recorded in the git ref `refs/deploy/current`, written only after the restart succeeds. A run that fails half-way therefore doesn't count as done: the next run tries the whole deployment again.
 
 It is deliberately conservative and **fails closed**. An unreachable GitHub API, a commit with no CI results, a red build, or a checkout that has diverged locally all leave the running version alone rather than guessing. A run that finds nothing new prints nothing at all, so the journal only ever contains real deployments.
 
@@ -210,7 +226,7 @@ sudo -u aemetbot git -C /opt/aemet-avisos-bot checkout <good-commit>
 sudo systemctl restart aemet-avisos-bot
 ```
 
-**This is a stopgap, not a pin.** The checkout is left detached at an ancestor of the branch, and `git merge --ff-only` advances an ancestor happily — so the next update run rolls the server forward onto the bad commit again. Use the pause to fix forward: revert the offending commit on the branch and deploy that. If you need the server to hold still in the meantime, stop the updater from running rather than relying on the checkout to resist it.
+**This is a stopgap, not a pin.** The updater compares the branch against `refs/deploy/current`, not against the checkout, so it leaves your rollback alone only until the branch gets a new commit. At that point it fast-forwards the server to the tip, carrying whatever that tip contains. Use the pause to fix forward: revert the offending commit on the branch and let that deploy. If the server must hold still whatever lands on the branch, stop the updater from running.
 
 > **The database is not backed up before an update.** The schema migration runs once and is idempotent afterwards, so the exposure is small, but `subscriptions.db` holds every user's subscriptions — copy it somewhere safe before a release you have doubts about.
 
@@ -227,7 +243,7 @@ AEMET RSS ──► rss_parser.py ──► dedupe ──► database.py ──�
 1. `bot.py` schedules a polling job every `POLL_INTERVAL_SECONDS` (plus a periodic sweep that prunes old seen-alert records).
 2. `rss_parser.py` discovers each region's per-zone feeds and fetches them concurrently over async HTTP — bounded concurrency, automatic retries with backoff — normalizing AEMET's ever-changing GUIDs into stable IDs and extracting each alert's severity, zone and validity window.
 3. `database.py` tracks subscriptions, which alerts have already been seen (and at what severity), and each user's minimum-level preference.
-4. New alerts — and alerts AEMET has escalated to a higher severity since they were first seen — are formatted (HTML-escaped, with severity emoji, region, validity window and a link) and sent only to subscribers whose `/nivel` preference allows that severity; subscribers who have blocked the bot are pruned automatically. `/avisos` runs the same fetch-and-filter pipeline on demand for a single user.
+4. New alerts — and alerts AEMET has escalated to a higher severity since they were first seen — are formatted (HTML-escaped, with severity emoji, region, validity window and a link) and sent only to subscribers whose `/nivel` preference allows that severity; subscribers who have blocked the bot are forgotten automatically. An alert that reached nobody isn't recorded, so the next cycle retries it for everyone; one that reached some subscribers is recorded, and the ones it missed transiently are queued and retried while the alert is still active. `/avisos` runs the same fetch-and-filter pipeline on demand for a single user.
 
 ## 🤝 Contributing
 

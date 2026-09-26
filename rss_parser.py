@@ -4,7 +4,7 @@ import asyncio
 import html
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -63,14 +63,20 @@ _RSS_LINK_RE = re.compile(
     r'href="(/documentos_d/eltiempo/prediccion/avisos/rss/[^"]*_RSS\.xml)"'
 )
 
+# The level as AEMET states it, e.g. "Aviso. Nivel amarillo. ...". Anchoring on
+# "Nivel" keeps a level word elsewhere in the title (a zone name, say) from
+# being mistaken for the alert's severity.
+_LEVEL_RE = re.compile(r"\bnivel (amarillo|naranja|rojo)\b", re.IGNORECASE)
+
 # Matches AEMET's validity phrasing, e.g.:
 #   "... de 13:00 31-08-2026 CEST (UTC+2) a 20:59 31-08-2026 CEST (UTC+2)."
 # The offset digits are optional to allow a bare "(UTC)", treated as UTC+0.
+# The zone abbreviation (CEST, WEST, ...) is kept so messages can show it.
 _VALIDITY_RE = re.compile(
     r"de (?P<sh>\d{2}):(?P<smin>\d{2}) (?P<sd>\d{2})-(?P<smo>\d{2})-(?P<sy>\d{4})"
-    r" \w+ \(UTC(?P<soff>[+-]?\d+)?\)"
+    r" (?P<stz>\w+) \(UTC(?P<soff>[+-]?\d+)?\)"
     r" a (?P<eh>\d{2}):(?P<emin>\d{2}) (?P<ed>\d{2})-(?P<emo>\d{2})-(?P<ey>\d{4})"
-    r" \w+ \(UTC(?P<eoff>[+-]?\d+)?\)"
+    r" (?P<etz>\w+) \(UTC(?P<eoff>[+-]?\d+)?\)"
 )
 
 
@@ -128,9 +134,7 @@ class Alert:
         lines = [header, location_line, f"📝 {title}"]
 
         if self.starts_at is not None and self.ends_at is not None:
-            start = self.starts_at.strftime("%d/%m %H:%M")
-            end = self.ends_at.strftime("%d/%m %H:%M")
-            lines.append(f"🕒 {start} → {end}")
+            lines.append(f"🕒 {_format_window(self.starts_at, self.ends_at)}")
 
         if self.description:
             lines.append("")
@@ -140,8 +144,32 @@ class Alert:
         lines.append(f'🔗 <a href="{link}">Más información</a>')
         return "\n".join(lines)
 
+    def is_expired(self, now: datetime) -> bool:
+        """True once the validity window has closed. Unknown windows never expire."""
+        return self.ends_at is not None and self.ends_at <= now
+
+
+def _format_window(starts_at: datetime, ends_at: datetime) -> str:
+    """Render a validity window in the alert's own time zone, labelled.
+
+    Canarias runs an hour behind the peninsula, so a bare "13:00" is
+    ambiguous for anyone following more than one region.
+    """
+    start = starts_at.strftime("%d/%m %H:%M")
+    end = ends_at.strftime("%d/%m %H:%M")
+    start_tz = starts_at.tzname()
+    end_tz = ends_at.tzname()
+    if start_tz == end_tz:
+        return f"{start} → {end} ({start_tz})"
+    return f"{start} ({start_tz}) → {end} ({end_tz})"
+
 
 def _parse_level(title: str) -> str | None:
+    match = _LEVEL_RE.search(title)
+    if match:
+        return match.group(1).lower()
+    # Fallback for a reworded title that no longer says "Nivel X": any level
+    # word, most severe first, so a doubtful alert is never under-ranked.
     title_lower = title.lower()
     for level in ("rojo", "naranja", "amarillo"):
         if level in title_lower:
@@ -185,7 +213,7 @@ def _parse_validity(description: str) -> tuple[datetime | None, datetime | None]
             int(g["sd"]),
             int(g["sh"]),
             int(g["smin"]),
-            tzinfo=timezone(timedelta(hours=start_offset)),
+            tzinfo=timezone(timedelta(hours=start_offset), g["stz"]),
         )
         ends_at = datetime(
             int(g["ey"]),
@@ -193,23 +221,53 @@ def _parse_validity(description: str) -> tuple[datetime | None, datetime | None]
             int(g["ed"]),
             int(g["eh"]),
             int(g["emin"]),
-            tzinfo=timezone(timedelta(hours=end_offset)),
+            tzinfo=timezone(timedelta(hours=end_offset), g["etz"]),
         )
     except ValueError:
         return None, None
     return starts_at, ends_at
 
 
-def build_client() -> httpx.AsyncClient:
-    """Build the shared HTTP client used to talk to AEMET.
+def _now() -> datetime:
+    """Current time; a seam so tests can pin the clock expiry is judged against."""
+    return datetime.now(timezone.utc)
 
-    Callers own the client's lifecycle (use it as an `async with` context).
+
+def build_client() -> httpx.AsyncClient:
+    """Build an HTTP client configured to talk to AEMET.
+
+    Callers own the client's lifecycle. The bot itself goes through
+    shared_client() so connections are reused across poll cycles.
     """
     return httpx.AsyncClient(
         timeout=HTTP_TIMEOUT_SECONDS,
         headers={"User-Agent": HTTP_USER_AGENT},
         follow_redirects=True,
     )
+
+
+# Key under which the application's long-lived client lives in bot_data.
+HTTP_CLIENT_KEY = "http_client"
+
+
+def shared_client(store: MutableMapping[str, object]) -> httpx.AsyncClient:
+    """Return the application-wide client kept in `store`, creating it lazily.
+
+    One client for the life of the process keeps TCP/TLS connections to
+    aemet.es alive between cycles instead of re-handshaking every few minutes.
+    """
+    client = store.get(HTTP_CLIENT_KEY)
+    if client is None or client.is_closed:
+        client = build_client()
+        store[HTTP_CLIENT_KEY] = client
+    return client
+
+
+async def close_shared_client(store: MutableMapping[str, object]) -> None:
+    """Close and forget the client created by shared_client(), if any."""
+    client = store.pop(HTTP_CLIENT_KEY, None)
+    if client is not None:
+        await client.aclose()
 
 
 async def _get(
@@ -330,34 +388,54 @@ def _parse_feed_bytes(data: bytes, source_url: str) -> list[Alert]:
 
 async def _fetch_region_alerts(
     region_code: str, client: httpx.AsyncClient, semaphore: asyncio.Semaphore
-) -> list[Alert]:
-    """Discover, fetch and parse all feeds for one region, deduplicated."""
+) -> list[Alert] | None:
+    """Discover, fetch and parse all feeds for one region, deduplicated.
+
+    Returns None when the region could not be read at all: no feed links on
+    its index page (unreachable, or AEMET changed the markup) or not one feed
+    body fetched. Every region's index lists its zone feeds even when there
+    are no alerts, so an empty discovery is a failure, never "all clear".
+    Expired alerts are dropped here, so no caller ever shows or sends one.
+    """
     feed_urls = await _discover_feed_urls(region_code, client, semaphore)
     if not feed_urls:
-        logger.info("No RSS feeds found for region %s", region_code)
-        return []
+        logger.warning("No RSS feeds found for region %s", region_code)
+        return None
 
     bodies = await asyncio.gather(
         *(_get(client, url, semaphore) for url in feed_urls),
         return_exceptions=False,
     )
+    if all(body is None for body in bodies):
+        logger.warning(
+            "None of the %d feed(s) of region %s could be fetched",
+            len(feed_urls),
+            region_code,
+        )
+        return None
 
+    now = _now()
     all_alerts: list[Alert] = []
     seen_ids: set[str] = set()
     for url, body in zip(feed_urls, bodies, strict=True):
         if body is None:
             continue
         for alert in _parse_feed_bytes(body, url):
+            if alert.is_expired(now):
+                continue
             if alert.canonical_id not in seen_ids:
                 seen_ids.add(alert.canonical_id)
                 all_alerts.append(alert)
     return all_alerts
 
 
-async def fetch_alerts(region_code: str, client: httpx.AsyncClient) -> list[Alert]:
+async def fetch_alerts(
+    region_code: str, client: httpx.AsyncClient
+) -> list[Alert] | None:
     """Fetch all alerts for a single region by discovering and parsing its feeds.
 
     Alerts are deduplicated across the region's own feeds by canonical_id.
+    Returns None if the region could not be read (see _fetch_region_alerts).
     Shares the process-wide HTTP semaphore with every other caller, so it is
     safe to call directly (outside of fetch_alerts_for_regions).
     """
@@ -366,22 +444,23 @@ async def fetch_alerts(region_code: str, client: httpx.AsyncClient) -> list[Aler
 
 async def fetch_alerts_for_regions(
     region_codes: Sequence[str], client: httpx.AsyncClient
-) -> dict[str, list[Alert]]:
+) -> dict[str, list[Alert] | None]:
     """Fetch alerts for several regions concurrently.
 
     The process-wide semaphore bounds HTTP concurrency across every region --
     and across concurrent calls to this function -- so real concurrency never
-    exceeds HTTP_MAX_CONCURRENCY. A region whose fetch fails maps to an empty
-    list and is logged; it never aborts the others.
+    exceeds HTTP_MAX_CONCURRENCY. A region that could not be read maps to
+    None (as opposed to [] for "read fine, no alerts") and is logged; it never
+    aborts the others.
     """
     semaphore = _get_semaphore()
 
-    async def _safe_fetch(region_code: str) -> list[Alert]:
+    async def _safe_fetch(region_code: str) -> list[Alert] | None:
         try:
             return await _fetch_region_alerts(region_code, client, semaphore)
         except Exception:
             logger.exception("Error fetching alerts for region %s", region_code)
-            return []
+            return None
 
     results = await asyncio.gather(*(_safe_fetch(code) for code in region_codes))
     return dict(zip(region_codes, results, strict=True))

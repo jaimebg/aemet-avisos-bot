@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 import config
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # SQLite's default compiled-in limit on the number of host parameters in a
 # single statement is 999. Stay comfortably under it when chunking `IN (...)`
@@ -93,6 +93,24 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    """Apply the v2 -> v3 schema change: per-recipient retry queue."""
+    # One row per (alert, user) whose delivery failed transiently. The alert
+    # itself is recorded in seen_alerts as soon as anyone received it, so this
+    # table is what lets the users it missed get it on a later cycle.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS failed_deliveries (
+            guid TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            previous_level TEXT,
+            failed_at TIMESTAMP NOT NULL,
+            PRIMARY KEY (guid, user_id)
+        )
+        """
+    )
+
+
 def init_db() -> None:
     """Create or upgrade the schema in place. Idempotent, never drops data."""
     conn = _connect()
@@ -119,6 +137,9 @@ def init_db() -> None:
 
     if version < 2:
         _migrate_v1_to_v2(conn)
+    if version < 3:
+        _migrate_v2_to_v3(conn)
+    if version < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     conn.commit()
@@ -154,6 +175,19 @@ def remove_all_subscriptions(user_id: int) -> int:
     return cursor.rowcount
 
 
+def forget_user(user_id: int) -> None:
+    """Delete everything stored about a user who blocked the bot.
+
+    Unlike remove_all_subscriptions (the user's own "unsubscribe from all"),
+    this also drops their level preference and any pending retries.
+    """
+    conn = _connect()
+    conn.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM user_prefs WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM failed_deliveries WHERE user_id = ?", (user_id,))
+    conn.commit()
+
+
 def get_user_subscriptions(user_id: int) -> list[str]:
     """Get region codes a user is subscribed to."""
     conn = _connect()
@@ -187,10 +221,22 @@ def mark_alert_seen(guid: str, level: str | None = None) -> None:
 
 
 def cleanup_old_alerts(days: int = 7) -> int:
-    """Remove seen alerts older than N days to keep the table small."""
+    """Remove seen alerts older than N days to keep the table small.
+
+    Pending retries go with them: a retry for an alert this old is stale, and
+    one whose alert is no longer recorded can never be matched again.
+    """
     conn = _connect()
     cursor = conn.execute(
         "DELETE FROM seen_alerts WHERE first_seen < datetime('now', ?)",
+        (f"-{days} days",),
+    )
+    conn.execute(
+        """
+        DELETE FROM failed_deliveries
+        WHERE failed_at < datetime('now', ?)
+           OR guid NOT IN (SELECT guid FROM seen_alerts)
+        """,
         (f"-{days} days",),
     )
     conn.commit()
@@ -278,3 +324,67 @@ def get_subscribers_with_min_rank(region_code: str) -> list[tuple[int, int]]:
     ).fetchall()
 
     return [(user_id, config.rank_for(min_level)) for user_id, min_level in rows]
+
+
+def record_failed_delivery(
+    guid: str, user_id: int, previous_level: str | None = None
+) -> None:
+    """Queue a delivery that failed transiently, for retry on a later cycle.
+
+    A later failure for the same (guid, user) replaces the earlier row, so the
+    queue always holds the most recent message variant to retry.
+    """
+    conn = _connect()
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO failed_deliveries
+            (guid, user_id, previous_level, failed_at)
+        VALUES (?, ?, ?, strftime('%Y-%m-%d %H:%M:%S', 'now'))
+        """,
+        (guid, user_id, previous_level),
+    )
+    conn.commit()
+
+
+def get_failed_deliveries(
+    guids: Sequence[str],
+) -> dict[str, list[tuple[int, str | None]]]:
+    """Map each guid with queued retries to its (user_id, previous_level) rows.
+
+    Guids with nothing queued are omitted; an empty input returns {} without
+    querying. Chunked like get_seen_levels.
+    """
+    if not guids:
+        return {}
+
+    conn = _connect()
+    result: dict[str, list[tuple[int, str | None]]] = {}
+    guid_list = list(guids)
+    for start in range(0, len(guid_list), _SQLITE_MAX_VARIABLES):
+        chunk = guid_list[start : start + _SQLITE_MAX_VARIABLES]
+        placeholders = ", ".join("?" for _ in chunk)
+        rows = conn.execute(
+            "SELECT guid, user_id, previous_level FROM failed_deliveries "
+            f"WHERE guid IN ({placeholders}) ORDER BY user_id",
+            chunk,
+        ).fetchall()
+        for guid, user_id, previous_level in rows:
+            result.setdefault(guid, []).append((user_id, previous_level))
+    return result
+
+
+def clear_failed_delivery(guid: str, user_id: int) -> None:
+    """Drop one queued retry (delivered, or no longer wanted)."""
+    conn = _connect()
+    conn.execute(
+        "DELETE FROM failed_deliveries WHERE guid = ? AND user_id = ?",
+        (guid, user_id),
+    )
+    conn.commit()
+
+
+def clear_failed_deliveries(guid: str) -> None:
+    """Drop every queued retry of guid, e.g. when an escalation supersedes it."""
+    conn = _connect()
+    conn.execute("DELETE FROM failed_deliveries WHERE guid = ?", (guid,))
+    conn.commit()

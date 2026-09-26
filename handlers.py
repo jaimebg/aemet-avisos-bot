@@ -15,7 +15,7 @@ from database import (
     remove_subscription,
     set_min_level,
 )
-from rss_parser import Alert, build_client, fetch_alerts_for_regions
+from rss_parser import Alert, fetch_alerts_for_regions, shared_client
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,15 @@ AEMET_AVISOS_URL = "https://www.aemet.es/es/eltiempo/prediccion/avisos"
 # Key under which /avisos keeps the ids of the users whose lookup is running.
 AVISOS_IN_FLIGHT_KEY = "avisos_in_flight"
 AVISOS_BUSY_TEXT = "⏳ Ya estoy consultando tus avisos. Espera unos segundos."
+AVISOS_UNREACHABLE_TEXT = (
+    "⚠️ Ahora mismo no puedo consultar la AEMET. Inténtalo en unos minutos o "
+    f"consulta {AEMET_AVISOS_URL}"
+)
+
+PRIVATE_ONLY_TEXT = (
+    "Solo funciono en chat privado: los avisos se envían a cada persona. "
+    "Escríbeme directamente para suscribirte."
+)
 
 LEVEL_LABELS = {
     "amarillo": "🟡 Amarillo y superiores",
@@ -110,6 +119,16 @@ def _build_level_keyboard(current: str) -> InlineKeyboardMarkup:
             label = f"✅ {label}"
         rows.append([InlineKeyboardButton(label, callback_data=f"{CB_LEVEL}{level}")])
     return InlineKeyboardMarkup(rows)
+
+
+async def private_only_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Answer a command sent from a group or channel instead of ignoring it."""
+    msg = _message(update)
+    if msg is None:
+        return
+    await msg.reply_text(PRIVATE_ONLY_TEXT)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -236,15 +255,29 @@ async def current_alerts_command(
     try:
         placeholder = await msg.reply_text("⏳ Consultando avisos activos…")
 
-        async with build_client() as client:
-            alerts_by_region = await fetch_alerts_for_regions(regions, client)
+        alerts_by_region = await fetch_alerts_for_regions(
+            regions, shared_client(context.bot_data)
+        )
+
+        # None marks a region that could not be read. Saying "no alerts" for
+        # it would be a false all-clear, so it is reported separately.
+        unreachable = [
+            code for code, alerts in alerts_by_region.items() if alerts is None
+        ]
+        if len(unreachable) == len(alerts_by_region):
+            await placeholder.edit_text(AVISOS_UNREACHABLE_TEXT)
+            return
+        unreachable_note = ""
+        if unreachable:
+            names = ", ".join(_region_name(code) for code in unreachable)
+            unreachable_note = f"\n\n⚠️ No se pudo consultar: {names}."
 
         min_level = get_min_level(user_id)
         min_rank = rank_for(min_level)
         matched: list[tuple[str, Alert]] = [
             (region_code, alert)
             for region_code, alerts in alerts_by_region.items()
-            for alert in alerts
+            for alert in alerts or []
             if min_rank <= alert.level_rank
         ]
 
@@ -252,13 +285,15 @@ async def current_alerts_command(
         if not matched:
             text = (
                 f"✅ No hay avisos activos en tus comunidades "
-                f"(nivel mínimo: <b>{name}</b>)."
+                f"(nivel mínimo: <b>{name}</b>).{unreachable_note}"
             )
             await placeholder.edit_text(text, parse_mode="HTML")
             return
 
         total = len(matched)
-        await placeholder.edit_text(f"📢 {total} aviso(s) activo(s):")
+        await placeholder.edit_text(
+            f"📢 {total} aviso(s) activo(s):{unreachable_note}", parse_mode="HTML"
+        )
 
         shown = matched[:MAX_AVISOS_ALERTS]
         for region_code, alert in shown:
@@ -287,6 +322,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if data.startswith(CB_SUBSCRIBE):
         region_code = data[len(CB_SUBSCRIBE) :]
+        if region_code not in REGIONS:
+            # Forged or stale callback data. Storing it would make every poll
+            # cycle request a nonexistent AEMET page on this user's behalf.
+            logger.warning("Ignoring subscribe to unknown region %r", region_code)
+            return
         region_name = _region_name(region_code)
         added = add_subscription(user_id, region_code)
         if added:
