@@ -342,7 +342,7 @@ def test_format_message_matches_exact_contract_for_cordoba_fixture(read_fixture)
         "🟡 Aviso AMARILLO\n"
         "📍 Andalucía · Campiña cordobesa\n"
         "📝 Aviso. Nivel amarillo. Temperaturas máximas. Campiña cordobesa\n"
-        "🕒 31/08 13:00 → 31/08 20:59\n"
+        "🕒 31/08 13:00 → 31/08 20:59 (CEST)\n"
         "\n"
         "Aviso de temperatura máxima de nivel amarillo de 13:00 31-08-2026 CEST "
         "(UTC+2) a 20:59 31-08-2026 CEST (UTC+2).\n"
@@ -402,3 +402,48 @@ def test_format_message_omits_description_block_when_empty():
     # Exactly one blank line in the whole message: the one right before the
     # link line. No leftover blank line from a skipped description block.
     assert message.count("\n\n") == 1
+
+
+# --- review fixes --------------------------------------------------------
+
+
+def test_parse_level_ignores_a_level_word_in_the_zone_name():
+    title = "Aviso. Nivel amarillo. Viento. Cabo Rojo"
+    assert _parse_level(title) == "amarillo"
+
+
+def test_parse_level_falls_back_to_any_level_word_without_nivel():
+    assert _parse_level("Aviso rojo por lluvias") == "rojo"
+
+
+def test_validity_keeps_the_zone_abbreviation():
+    starts_at, ends_at = _parse_validity(
+        "de 10:00 01-01-2026 WET (UTC+0) a 12:00 01-01-2026 WET (UTC+0)."
+    )
+    assert starts_at.tzname() == "WET"
+    assert ends_at.tzname() == "WET"
+
+
+def test_format_message_labels_each_end_when_the_zone_changes():
+    alert = Alert(
+        title="Aviso. Nivel amarillo. Viento. Zona",
+        description="",
+        link="",
+        guid="x.xml",
+        pub_date="",
+        level="amarillo",
+        starts_at=datetime(2026, 3, 29, 1, 0, tzinfo=timezone(timedelta(0), "WET")),
+        ends_at=datetime(
+            2026, 3, 29, 12, 0, tzinfo=timezone(timedelta(hours=1), "WEST")
+        ),
+    )
+    assert "🕒 29/03 01:00 (WET) → 29/03 12:00 (WEST)" in alert.format_message("coo")
+
+
+def test_is_expired_only_after_the_window_closes():
+    end = datetime(2026, 8, 31, 20, 59, tzinfo=timezone(timedelta(hours=2)))
+    alert = Alert("t", "", "", "x.xml", "", "amarillo", ends_at=end)
+    assert not alert.is_expired(end - timedelta(minutes=1))
+    assert alert.is_expired(end)
+    no_window = Alert("t", "", "", "x.xml", "", "amarillo")
+    assert not no_window.is_expired(end)

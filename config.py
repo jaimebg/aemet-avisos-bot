@@ -49,6 +49,11 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", "subscriptions.db")
 SEEN_RETENTION_DAYS = _env_int("SEEN_RETENTION_DAYS", 7)
 CLEANUP_INTERVAL_SECONDS = _env_int("CLEANUP_INTERVAL_SECONDS", 3600)
 
+# Optional Telegram chat that hears about operational problems (0 = off), and
+# how many consecutive poll cycles with no readable AEMET region count as one.
+ADMIN_CHAT_ID = _env_int("ADMIN_CHAT_ID", 0)
+FEED_FAILURE_ALERT_CYCLES = _env_int("FEED_FAILURE_ALERT_CYCLES", 3)
+
 AEMET_BASE_URL = "https://www.aemet.es"
 
 HTTP_TIMEOUT_SECONDS = _env_float("HTTP_TIMEOUT_SECONDS", 20.0)
@@ -126,4 +131,9 @@ def validate() -> None:
     if POLL_INTERVAL_SECONDS < 60:
         raise ConfigError(
             f"POLL_INTERVAL_SECONDS must be at least 60 (got {POLL_INTERVAL_SECONDS})."
+        )
+    if FEED_FAILURE_ALERT_CYCLES < 1:
+        raise ConfigError(
+            "FEED_FAILURE_ALERT_CYCLES must be at least 1 "
+            f"(got {FEED_FAILURE_ALERT_CYCLES})."
         )

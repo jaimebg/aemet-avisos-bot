@@ -7,8 +7,10 @@ aemet.es.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 import httpx
+import pytest
 
 import rss_parser
 from config import RSS_INDEX_URL_TEMPLATE
@@ -18,6 +20,15 @@ from rss_parser import (
     fetch_alerts,
     fetch_alerts_for_regions,
 )
+
+# The fixtures describe alerts valid on 31-08-2026. Judge expiry against a
+# clock from before then, so these tests do not start failing as time passes.
+FIXTURE_NOW = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def pinned_clock(monkeypatch):
+    monkeypatch.setattr(rss_parser, "_now", lambda: FIXTURE_NOW)
 
 
 async def _instant_sleep(*_args, **_kwargs) -> None:
@@ -100,14 +111,16 @@ async def test_fetch_alerts_returns_both_alerts_from_different_feeds_in_order():
 # --- test 3: index 404 yields [] without raising --------------------------
 
 
-async def test_fetch_alerts_returns_empty_list_when_index_page_404s():
+async def test_fetch_alerts_returns_none_when_index_page_404s():
+    """An unreadable region is None, never a false "no alerts" []."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, content=b"not found")
 
     async with _client(handler) as client:
         alerts = await fetch_alerts("xx", client)
 
-    assert alerts == []
+    assert alerts is None
 
 
 # --- test 4: one feed 500s persistently, other feed still succeeds -------
@@ -207,7 +220,7 @@ async def test_fetch_alerts_for_regions_isolates_a_failing_region(monkeypatch):
         results = await fetch_alerts_for_regions(["mad", "and"], client)
 
     assert set(results.keys()) == {"mad", "and"}
-    assert results["and"] == []
+    assert results["and"] is None
     assert [a.canonical_id for a in results["mad"]] == ["MADMAD44.xml"]
 
 
@@ -343,3 +356,52 @@ def test_parse_feed_bytes_on_garbage_bytes_returns_empty_list_without_raising():
     alerts = _parse_feed_bytes(b"not xml at all", "https://example/feed")
 
     assert alerts == []
+
+
+# --- review fixes --------------------------------------------------------
+
+
+async def test_fetch_alerts_drops_expired_alerts(read_fixture, monkeypatch):
+    feed_path = "/documentos_d/eltiempo/prediccion/avisos/rss/FEED_CO_RSS.xml"
+    index_html = _index_html([feed_path])
+    feed = read_fixture("feed_cordoba_amarillo.xml")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == _index_url("and"):
+            return httpx.Response(200, content=index_html)
+        return httpx.Response(200, content=feed)
+
+    async with _client(handler) as client:
+        assert len(await fetch_alerts("and", client)) == 1
+        monkeypatch.setattr(
+            rss_parser, "_now", lambda: datetime(2026, 9, 1, tzinfo=timezone.utc)
+        )
+        assert await fetch_alerts("and", client) == []
+
+
+async def test_fetch_alerts_returns_none_when_every_feed_fails(monkeypatch):
+    monkeypatch.setattr(rss_parser.asyncio, "sleep", _instant_sleep)
+    monkeypatch.setattr(rss_parser, "HTTP_MAX_RETRIES", 0)
+    index_html = _index_html(
+        ["/documentos_d/eltiempo/prediccion/avisos/rss/FEED_A_RSS.xml"]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == _index_url("xx"):
+            return httpx.Response(200, content=index_html)
+        return httpx.Response(500, content=b"server error")
+
+    async with _client(handler) as client:
+        assert await fetch_alerts("xx", client) is None
+
+
+async def test_shared_client_is_reused_until_closed():
+    store: dict[str, object] = {}
+    first = rss_parser.shared_client(store)
+    assert rss_parser.shared_client(store) is first
+
+    await rss_parser.close_shared_client(store)
+    assert first.is_closed
+    second = rss_parser.shared_client(store)
+    assert second is not first
+    await rss_parser.close_shared_client(store)
